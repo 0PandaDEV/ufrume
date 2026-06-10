@@ -4,11 +4,12 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::{
     collections::HashMap,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Instant,
 };
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct MetadataKey {
@@ -28,7 +29,7 @@ pub struct OrganizeResult {
 
 pub fn organize_music_files(
     music_files: &[(PathBuf, AudioMetadata)],
-    output_dir: &PathBuf,
+    output_dir: &Path,
     config: &Config,
 ) -> Result<OrganizeResult, Box<dyn std::error::Error>> {
     if music_files.is_empty() {
@@ -40,9 +41,20 @@ pub fn organize_music_files(
         });
     }
 
+    let mut sorted_files: Vec<(PathBuf, AudioMetadata)> = music_files.to_vec();
+    sorted_files.sort_by(|a, b| {
+        let mtime_a = std::fs::metadata(&a.0)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let mtime_b = std::fs::metadata(&b.0)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        mtime_b.cmp(&mtime_a)
+    });
+
     let start_time = Instant::now();
 
-    let pb = Arc::new(ProgressBar::new(music_files.len() as u64));
+    let pb = Arc::new(ProgressBar::new(sorted_files.len() as u64));
     pb.set_style(
         ProgressStyle::default_bar()
             .template("  [{bar:40.cyan/blue}] {pos}/{len} [{elapsed_precise}] {msg}")?
@@ -57,16 +69,7 @@ pub fn organize_music_files(
     let used_metadata: Arc<Mutex<HashMap<MetadataKey, PathBuf>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    if let Ok(existing_files) = crate::scan::scan_for_music(output_dir) {
-        let mut metadata_map = used_metadata.lock().unwrap();
-        for (path, metadata) in existing_files {
-            if let Some(metadata_key) = create_metadata_key(&metadata) {
-                metadata_map.insert(metadata_key, path);
-            }
-        }
-    }
-
-    music_files.par_iter().for_each(|(source_path, metadata)| {
+    sorted_files.par_iter().for_each(|(source_path, metadata)| {
         if let Some(filename) = source_path.file_name() {
             pb.set_message(filename.to_string_lossy().to_string());
         }
@@ -83,7 +86,8 @@ pub fn organize_music_files(
                     *duplicates.lock().unwrap() += 1;
                 }
             },
-            Err(_) => {
+            Err(e) => {
+                warn!("failed to organize {}: {}", source_path.display(), e);
                 *failed.lock().unwrap() += 1;
             }
         }
@@ -101,8 +105,17 @@ pub fn organize_music_files(
         duplicates: *duplicates.lock().unwrap(),
     };
 
+    info!(
+        "organized {} files in {:.2}s (skipped {}, duplicates {}, failed {})",
+        result.moved,
+        duration.as_secs_f64(),
+        result.skipped,
+        result.duplicates,
+        result.failed
+    );
+
     println!(
-        "  {} files copied in {:.2}s",
+        "  {} files moved in {:.2}s",
         result.moved,
         duration.as_secs_f64()
     );
@@ -129,7 +142,7 @@ enum FileResult {
 fn organize_single_file(
     source_path: &PathBuf,
     metadata: &AudioMetadata,
-    output_dir: &PathBuf,
+    output_dir: &Path,
     config: &Config,
     used_metadata: &Arc<Mutex<HashMap<MetadataKey, PathBuf>>>,
 ) -> Result<FileResult, Box<dyn std::error::Error>> {
@@ -199,13 +212,33 @@ fn organize_single_file(
         }
     };
 
-    if let Some(parent) = final_target_path.parent() {
+    if final_target_path == *source_path {
+        return Ok(FileResult::Skipped);
+    }
+
+    move_file(source_path, &final_target_path)?;
+    debug!(
+        "moved {} -> {}",
+        source_path.display(),
+        final_target_path.display()
+    );
+
+    Ok(FileResult::Moved)
+}
+
+fn move_file(source_path: &Path, target_path: &Path) -> io::Result<()> {
+    if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    fs::copy(source_path, &final_target_path)?;
-
-    Ok(FileResult::Moved)
+    match fs::rename(source_path, target_path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(source_path, target_path)?;
+            fs::remove_file(source_path)?;
+            Ok(())
+        }
+    }
 }
 
 fn generate_target_path(
