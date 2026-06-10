@@ -8,11 +8,13 @@ mod logging;
 mod organize;
 mod replaygain;
 mod scan;
+mod tag;
 
 use crate::config::load_or_create_config;
 use crate::organize::organize_music_files;
 use crate::replaygain::apply_replaygain;
 use crate::scan::scan_for_music;
+use crate::tag::tag_music_files;
 
 #[derive(Parser)]
 #[command(name = "ufrume")]
@@ -35,6 +37,8 @@ enum Commands {
     Organize { dir: Option<PathBuf> },
 
     Replaygain { path: Option<PathBuf> },
+
+    Tag { path: Option<PathBuf> },
 }
 
 fn resolve_path(arg: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -181,6 +185,37 @@ fn run_replaygain(path: Option<PathBuf>) {
     }
 }
 
+fn run_tag(path: Option<PathBuf>) {
+    let path = match resolve_path(path) {
+        Ok(path) => path,
+        Err(e) => {
+            error!("{}", e);
+            eprintln!("ERROR: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if !path.exists() {
+        error!("tag target does not exist: {}", path.display());
+        eprintln!("ERROR: Path does not exist: {}", path.display());
+        std::process::exit(1);
+    }
+
+    info!("tagging files in: {}", path.display());
+    println!(
+        "{} {}",
+        style("[1/1]").bold().dim(),
+        "Tagging music files via MusicBrainz..."
+    );
+    println!("  Target: {}", style(path.display()).green());
+
+    if let Err(e) = tag_music_files(&path) {
+        error!("failed to tag files: {}", e);
+        eprintln!("ERROR: Failed to tag files: {}", e);
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     match logging::init() {
         Ok(log_path) => log_startup(&log_path),
@@ -194,6 +229,7 @@ fn main() {
     match cli.command {
         Commands::Organize { dir } => run_organize(dir, cli.verbose),
         Commands::Replaygain { path } => run_replaygain(path),
+        Commands::Tag { path } => run_tag(path),
     }
 
     info!("done");
