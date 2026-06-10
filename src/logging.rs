@@ -16,10 +16,8 @@ pub fn init() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
     let file = File::create(&path)?;
 
-    // Our own code logs at DEBUG; noisy dependencies are capped at WARN.
-    // `RUST_LOG` overrides this default when set.
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,ufrume=debug"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn,ufrume=debug"));
 
     tracing_subscriber::fmt()
         .with_ansi(false)

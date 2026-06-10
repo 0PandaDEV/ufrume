@@ -10,8 +10,8 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime};
-use symphonia::core::codecs::audio::{AudioDecoderOptions, CODEC_ID_NULL_AUDIO};
 use symphonia::core::codecs::CodecParameters;
+use symphonia::core::codecs::audio::{AudioDecoderOptions, CODEC_ID_NULL_AUDIO};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::formats::probe::Hint;
@@ -67,18 +67,16 @@ pub fn apply_replaygain(path: &Path) -> Result<(), Box<dyn Error>> {
     }
 
     albums.sort_by(|a, b| {
-        let mtime_a = a
-            .1
-            .first()
-            .and_then(|f| std::fs::metadata(f).ok())
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let mtime_b = b
-            .1
-            .first()
-            .and_then(|f| std::fs::metadata(f).ok())
-            .and_then(|m| m.modified().ok())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let mtime_a =
+            a.1.first()
+                .and_then(|f| std::fs::metadata(f).ok())
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+        let mtime_b =
+            b.1.first()
+                .and_then(|f| std::fs::metadata(f).ok())
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
         mtime_b.cmp(&mtime_a)
     });
 
@@ -222,7 +220,10 @@ fn has_replaygain_tags(path: &Path) -> bool {
     let Ok(tagged_file) = lofty::read_from_path(path) else {
         return false;
     };
-    let Some(tag) = tagged_file.primary_tag().or_else(|| tagged_file.first_tag()) else {
+    let Some(tag) = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())
+    else {
         return false;
     };
     let has_track_gain = tag
@@ -285,10 +286,8 @@ fn analyze_track(path: &Path) -> Result<TrackAnalysis, Box<dyn Error>> {
         .count();
     let sample_rate = audio_params.sample_rate.ok_or("unknown sample rate")?;
 
-    let mut decoder = symphonia::default::get_codecs().make_audio_decoder(
-        audio_params,
-        &AudioDecoderOptions::default(),
-    )?;
+    let mut decoder = symphonia::default::get_codecs()
+        .make_audio_decoder(audio_params, &AudioDecoderOptions::default())?;
 
     let mut ebu = EbuR128::new(channels as u32, sample_rate, Mode::I | Mode::TRUE_PEAK)?;
     let mut samples: Vec<f32> = Vec::new();
