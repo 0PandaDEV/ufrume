@@ -3,7 +3,7 @@ use crate::{config::Config, scan::AudioMetadata};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -70,12 +70,43 @@ pub fn organize_music_files(
     let used_metadata: Arc<Mutex<HashMap<MetadataKey, PathBuf>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    let multi_disc_albums: HashSet<(String, String)> = {
+        let mut disc_counts: HashMap<(String, String), HashSet<u16>> = HashMap::new();
+        for (_, meta) in &sorted_files {
+            if let (Some(disc), Some(album)) = (meta.disc, &meta.album) {
+                let artist = meta
+                    .album_artist
+                    .as_ref()
+                    .or(meta.artist.as_ref())
+                    .cloned()
+                    .unwrap_or_default();
+                disc_counts
+                    .entry((artist, album.clone()))
+                    .or_default()
+                    .insert(disc);
+            }
+        }
+        disc_counts
+            .into_iter()
+            .filter(|(_, discs)| discs.len() > 1)
+            .map(|(k, _)| k)
+            .collect()
+    };
+    let multi_disc_albums = Arc::new(multi_disc_albums);
+
     sorted_files.par_iter().for_each(|(source_path, metadata)| {
         if let Some(filename) = source_path.file_name() {
             pb.set_message(filename.to_string_lossy().to_string());
         }
 
-        match organize_single_file(source_path, metadata, output_dir, config, &used_metadata) {
+        match organize_single_file(
+            source_path,
+            metadata,
+            output_dir,
+            config,
+            &used_metadata,
+            &multi_disc_albums,
+        ) {
             Ok(result) => match result {
                 FileResult::Moved => {
                     *moved.lock().unwrap() += 1;
@@ -148,8 +179,9 @@ fn organize_single_file(
     output_dir: &Path,
     config: &Config,
     used_metadata: &Arc<Mutex<HashMap<MetadataKey, PathBuf>>>,
+    multi_disc_albums: &Arc<HashSet<(String, String)>>,
 ) -> Result<FileResult, Box<dyn std::error::Error>> {
-    let relative_path = match generate_target_path(source_path, metadata, config) {
+    let relative_path = match generate_target_path(source_path, metadata, config, multi_disc_albums) {
         Some(path) => path,
         None => {
             if config.rules.handle_missing_metadata == "skip" {
@@ -260,6 +292,7 @@ fn generate_target_path(
     source_path: &PathBuf,
     metadata: &AudioMetadata,
     config: &Config,
+    multi_disc_albums: &HashSet<(String, String)>,
 ) -> Option<PathBuf> {
     let structure = if is_compilation(metadata) {
         config
@@ -271,7 +304,7 @@ fn generate_target_path(
         &config.organization.structure
     };
 
-    let path_str = replace_placeholders(structure, source_path, metadata, config)?;
+    let path_str = replace_placeholders(structure, source_path, metadata, config, multi_disc_albums)?;
     let sanitized_path = sanitize_path(&path_str, config);
     Some(PathBuf::from(sanitized_path))
 }
@@ -296,6 +329,7 @@ fn replace_placeholders(
     source_path: &PathBuf,
     metadata: &AudioMetadata,
     config: &Config,
+    multi_disc_albums: &HashSet<(String, String)>,
 ) -> Option<String> {
     let mut result = template.to_string();
 
@@ -355,30 +389,57 @@ fn replace_placeholders(
         }
     }
 
+    let is_multi_disc = metadata.disc.map_or(false, |_| {
+        let artist = metadata
+            .album_artist
+            .as_ref()
+            .or(metadata.artist.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let album = metadata.album.as_ref().cloned().unwrap_or_default();
+        multi_disc_albums.contains(&(artist, album))
+    });
+
     if template.contains("{disc") {
         if let Some(disc) = metadata.disc {
-            if let Some(start) = template.find("{disc") {
-                if let Some(end) = template[start..].find('}') {
-                    let full_placeholder = &template[start..start + end + 1];
-                    if full_placeholder.contains(':') {
-                        let format_part = &full_placeholder[7..full_placeholder.len() - 1];
-                        if format_part == "02" {
-                            result = result.replace(full_placeholder, &format!("{:02}", disc));
+            if is_multi_disc {
+                if let Some(start) = template.find("{disc") {
+                    if let Some(end) = template[start..].find('}') {
+                        let full_placeholder = &template[start..start + end + 1];
+                        if full_placeholder.contains(':') {
+                            let format_part = &full_placeholder[7..full_placeholder.len() - 1];
+                            if format_part == "02" {
+                                result =
+                                    result.replace(full_placeholder, &format!("{:02}", disc));
+                            } else {
+                                result = result.replace(full_placeholder, &disc.to_string());
+                            }
                         } else {
-                            result = result.replace(full_placeholder, &disc.to_string());
+                            result = result.replace("{disc}", &format!("Disc {}", disc));
                         }
-                    } else {
-                        result = result.replace("{disc}", &format!("Disc {}", disc));
                     }
                 }
+            } else {
+                if let Some(start) = template.find("{disc") {
+                    if let Some(end) = template[start..].find('}') {
+                        let full_placeholder = &template[start..start + end + 1];
+                        result = result.replace(&format!("/{}/", full_placeholder), "/");
+                        result = result.replace(&format!("/{}", full_placeholder), "");
+                        result = result.replace(&format!("{}/", full_placeholder), "");
+                        result = result.replace(full_placeholder, "");
+                    }
+                }
+                let _ = disc;
             }
         } else if template.contains("{disc") {
             return None;
         }
     } else if let Some(disc) = metadata.disc {
-        if let Some(track_pos) = result.rfind('/') {
-            let after_slash = &result[track_pos + 1..];
-            result = format!("{}/Disc {}/{}", &result[..track_pos], disc, after_slash);
+        if is_multi_disc {
+            if let Some(track_pos) = result.rfind('/') {
+                let after_slash = &result[track_pos + 1..];
+                result = format!("{}/Disc {}/{}", &result[..track_pos], disc, after_slash);
+            }
         }
     }
 
