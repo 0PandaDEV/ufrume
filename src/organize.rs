@@ -17,6 +17,7 @@ struct MetadataKey {
     album: String,
     title: String,
     track: Option<u16>,
+    disc: Option<u16>,
 }
 
 #[derive(Debug)]
@@ -97,6 +98,8 @@ pub fn organize_music_files(
 
     pb.finish_and_clear();
 
+    cleanup_empty_dirs(output_dir);
+
     let duration = start_time.elapsed();
     let result = OrganizeResult {
         moved: *moved.lock().unwrap(),
@@ -157,7 +160,18 @@ fn organize_single_file(
         }
     };
 
-    let target_path = output_dir.join(&relative_path);
+    let target_path = if source_path.starts_with(output_dir) {
+        let dir_name = output_dir.file_name().unwrap_or_default().to_string_lossy();
+        let template_str = relative_path.to_string_lossy();
+        let stripped = if template_str.starts_with(&*format!("{}/", dir_name)) {
+            PathBuf::from(&template_str[dir_name.len() + 1..])
+        } else {
+            relative_path.clone()
+        };
+        output_dir.join(&stripped)
+    } else {
+        output_dir.join(&relative_path)
+    };
 
     let final_target_path = {
         let metadata_key = create_metadata_key(metadata);
@@ -195,6 +209,7 @@ fn organize_single_file(
                     .to_string_lossy()
                     .to_string(),
                 track: None,
+                disc: None,
             };
 
             if metadata_map.contains_key(&fallback_key) {
@@ -340,6 +355,33 @@ fn replace_placeholders(
         }
     }
 
+    if template.contains("{disc") {
+        if let Some(disc) = metadata.disc {
+            if let Some(start) = template.find("{disc") {
+                if let Some(end) = template[start..].find('}') {
+                    let full_placeholder = &template[start..start + end + 1];
+                    if full_placeholder.contains(':') {
+                        let format_part = &full_placeholder[7..full_placeholder.len() - 1];
+                        if format_part == "02" {
+                            result = result.replace(full_placeholder, &format!("{:02}", disc));
+                        } else {
+                            result = result.replace(full_placeholder, &disc.to_string());
+                        }
+                    } else {
+                        result = result.replace("{disc}", &format!("Disc {}", disc));
+                    }
+                }
+            }
+        } else if template.contains("{disc") {
+            return None;
+        }
+    } else if let Some(disc) = metadata.disc {
+        if let Some(track_pos) = result.rfind('/') {
+            let after_slash = &result[track_pos + 1..];
+            result = format!("{}/Disc {}/{}", &result[..track_pos], disc, after_slash);
+        }
+    }
+
     if let Some(genre) = &metadata.genre {
         result = result.replace("{genre}", &sanitize_metadata_value(genre, config));
     } else if template.contains("{genre}") {
@@ -450,6 +492,7 @@ fn create_metadata_key(metadata: &AudioMetadata) -> Option<MetadataKey> {
         album: album.clone(),
         title: title.clone(),
         track: metadata.track,
+        disc: metadata.disc,
     })
 }
 
@@ -466,5 +509,22 @@ fn is_compilation(metadata: &AudioMetadata) -> bool {
         album_artist.to_lowercase() == "various artists"
     } else {
         false
+    }
+}
+
+fn cleanup_empty_dirs(dir: &Path) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                cleanup_empty_dirs(&entry.path());
+            }
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(dir) {
+        let is_empty = entries.flatten().count() == 0;
+        if is_empty && dir != Path::new("") {
+            let _ = fs::remove_dir(dir);
+        }
     }
 }

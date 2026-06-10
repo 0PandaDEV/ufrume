@@ -21,6 +21,7 @@ pub struct AudioMetadata {
     pub year: Option<i32>,
     pub genre: Option<String>,
     pub track: Option<u16>,
+    pub disc: Option<u16>,
 }
 
 pub fn is_music_file(path: &Path) -> bool {
@@ -174,6 +175,7 @@ fn extract_metadata(path: &Path) -> Result<AudioMetadata, Box<dyn std::error::Er
             year: None,
             genre: None,
             track: None,
+            disc: None,
         });
     };
 
@@ -187,6 +189,9 @@ fn extract_metadata(path: &Path) -> Result<AudioMetadata, Box<dyn std::error::Er
         year: tag.date().map(|ts| ts.year as i32),
         genre: tag.genre().map(|c| c.to_string()),
         track: tag.track().map(|t| t as u16),
+        disc: tag
+            .get_string(ItemKey::DiscNumber)
+            .and_then(|s| s.parse::<u16>().ok()),
     })
 }
 
