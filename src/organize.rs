@@ -181,7 +181,8 @@ fn organize_single_file(
     used_metadata: &Arc<Mutex<HashMap<MetadataKey, PathBuf>>>,
     multi_disc_albums: &Arc<HashSet<(String, String)>>,
 ) -> Result<FileResult, Box<dyn std::error::Error>> {
-    let relative_path = match generate_target_path(source_path, metadata, config, multi_disc_albums) {
+    let relative_path = match generate_target_path(source_path, metadata, config, multi_disc_albums)
+    {
         Some(path) => path,
         None => {
             if config.rules.handle_missing_metadata == "skip" {
@@ -304,7 +305,8 @@ fn generate_target_path(
         &config.organization.structure
     };
 
-    let path_str = replace_placeholders(structure, source_path, metadata, config, multi_disc_albums)?;
+    let path_str =
+        replace_placeholders(structure, source_path, metadata, config, multi_disc_albums)?;
     let sanitized_path = sanitize_path(&path_str, config);
     Some(PathBuf::from(sanitized_path))
 }
@@ -409,8 +411,7 @@ fn replace_placeholders(
                         if full_placeholder.contains(':') {
                             let format_part = &full_placeholder[7..full_placeholder.len() - 1];
                             if format_part == "02" {
-                                result =
-                                    result.replace(full_placeholder, &format!("{:02}", disc));
+                                result = result.replace(full_placeholder, &format!("{:02}", disc));
                             } else {
                                 result = result.replace(full_placeholder, &disc.to_string());
                             }
