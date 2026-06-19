@@ -34,11 +34,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Organize { dir: Option<PathBuf> },
+    Organize {
+        dir: Option<PathBuf>,
+    },
 
-    Replaygain { path: Option<PathBuf> },
+    Replaygain {
+        path: Option<PathBuf>,
+        #[arg(short, long)]
+        force: bool,
+    },
 
-    Tag { path: Option<PathBuf> },
+    Tag {
+        path: Option<PathBuf>,
+        #[arg(short, long)]
+        force: bool,
+    },
 }
 
 fn resolve_path(arg: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -154,7 +164,7 @@ fn print_scan_preview(music_files: &[(PathBuf, scan::AudioMetadata)]) {
     }
 }
 
-fn run_replaygain(path: Option<PathBuf>) {
+fn run_replaygain(path: Option<PathBuf>, force: bool) {
     let path = match resolve_path(path) {
         Ok(path) => path,
         Err(e) => {
@@ -178,14 +188,14 @@ fn run_replaygain(path: Option<PathBuf>) {
     );
     println!("  Target: {}", style(path.display()).green());
 
-    if let Err(e) = apply_replaygain(&path) {
+    if let Err(e) = apply_replaygain(&path, force) {
         error!("failed to compute ReplayGain: {}", e);
         eprintln!("ERROR: Failed to compute ReplayGain: {}", e);
         std::process::exit(1);
     }
 }
 
-fn run_tag(path: Option<PathBuf>) {
+fn run_tag(path: Option<PathBuf>, force: bool) {
     let path = match resolve_path(path) {
         Ok(path) => path,
         Err(e) => {
@@ -209,7 +219,7 @@ fn run_tag(path: Option<PathBuf>) {
     );
     println!("  Target: {}", style(path.display()).green());
 
-    if let Err(e) = tag_music_files(&path) {
+    if let Err(e) = tag_music_files(&path, force) {
         error!("failed to tag files: {}", e);
         eprintln!("ERROR: Failed to tag files: {}", e);
         std::process::exit(1);
@@ -228,8 +238,8 @@ fn main() {
 
     match cli.command {
         Commands::Organize { dir } => run_organize(dir, cli.verbose),
-        Commands::Replaygain { path } => run_replaygain(path),
-        Commands::Tag { path } => run_tag(path),
+        Commands::Replaygain { path, force } => run_replaygain(path, force),
+        Commands::Tag { path, force } => run_tag(path, force),
     }
 
     info!("done");

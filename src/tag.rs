@@ -354,7 +354,7 @@ fn write_metadata_tags(
     Ok(())
 }
 
-pub fn tag_music_files(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn tag_music_files(path: &Path, force: bool) -> Result<(), Box<dyn std::error::Error>> {
     let files: Vec<PathBuf> = if path.is_file() {
         if !is_music_file(path) {
             return Err(format!("{} is not a supported audio file", path.display()).into());
@@ -404,7 +404,7 @@ pub fn tag_music_files(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
         pb.set_message(rel_path.clone());
 
-        if has_musicbrainz_tags(file) {
+        if !force && has_musicbrainz_tags(file) {
             skipped_count += 1;
             pb.inc(1);
             continue;

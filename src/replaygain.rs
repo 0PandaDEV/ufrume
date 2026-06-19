@@ -25,7 +25,7 @@ struct TrackAnalysis {
     state: EbuR128,
 }
 
-pub fn apply_replaygain(path: &Path) -> Result<(), Box<dyn Error>> {
+pub fn apply_replaygain(path: &Path, force: bool) -> Result<(), Box<dyn Error>> {
     let files: Vec<PathBuf> = if path.is_file() {
         if !is_music_file(path) {
             return Err(format!("{} is not a supported audio file", path.display()).into());
@@ -108,7 +108,7 @@ pub fn apply_replaygain(path: &Path) -> Result<(), Box<dyn Error>> {
     let failed = Arc::new(Mutex::new(0usize));
 
     for (album_dir, album_files) in &albums {
-        let needs_processing = album_files.iter().any(|f| !has_replaygain_tags(f));
+        let needs_processing = force || album_files.iter().any(|f| !has_replaygain_tags(f));
         if !needs_processing {
             skipped_albums += 1;
             for _ in album_files {
