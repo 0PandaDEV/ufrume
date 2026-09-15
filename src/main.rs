@@ -36,6 +36,8 @@ struct Cli {
 enum Commands {
     Organize {
         dir: Option<PathBuf>,
+        #[arg(long)]
+        normalize: bool,
     },
 
     Replaygain {
@@ -78,7 +80,7 @@ fn configure_threads(threads: Option<usize>) {
     }
 }
 
-fn run_organize(dir: Option<PathBuf>, verbose: bool) {
+fn run_organize(dir: Option<PathBuf>, verbose: bool, normalize: bool) {
     let dir = match resolve_path(dir) {
         Ok(dir) => dir,
         Err(e) => {
@@ -142,7 +144,7 @@ fn run_organize(dir: Option<PathBuf>, verbose: bool) {
         "Organizing music files..."
     );
 
-    if let Err(e) = organize_music_files(&music_files, &dir, &config) {
+    if let Err(e) = organize_music_files(&music_files, &dir, &config, normalize) {
         error!("failed to organize music files: {}", e);
         eprintln!("ERROR: Failed to organize music files: {}", e);
         std::process::exit(1);
@@ -237,7 +239,7 @@ fn main() {
     configure_threads(cli.threads);
 
     match cli.command {
-        Commands::Organize { dir } => run_organize(dir, cli.verbose),
+        Commands::Organize { dir, normalize } => run_organize(dir, cli.verbose, normalize),
         Commands::Replaygain { path, force } => run_replaygain(path, force),
         Commands::Tag { path, force } => run_tag(path, force),
     }

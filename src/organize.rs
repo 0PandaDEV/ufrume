@@ -1,6 +1,9 @@
 use crate::{config::Config, scan::AudioMetadata};
 
 use indicatif::{ProgressBar, ProgressStyle};
+use lofty::config::WriteOptions;
+use lofty::prelude::*;
+use lofty::tag::{ItemKey, Tag};
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
@@ -32,6 +35,7 @@ pub fn organize_music_files(
     music_files: &[(PathBuf, AudioMetadata)],
     output_dir: &Path,
     config: &Config,
+    normalize: bool,
 ) -> Result<OrganizeResult, Box<dyn std::error::Error>> {
     if music_files.is_empty() {
         return Ok(OrganizeResult {
@@ -104,6 +108,7 @@ pub fn organize_music_files(
             metadata,
             output_dir,
             config,
+            normalize,
             &used_metadata,
             &multi_disc_albums,
         ) {
@@ -178,9 +183,25 @@ fn organize_single_file(
     metadata: &AudioMetadata,
     output_dir: &Path,
     config: &Config,
+    normalize: bool,
     used_metadata: &Arc<Mutex<HashMap<MetadataKey, PathBuf>>>,
     multi_disc_albums: &Arc<HashSet<(String, String)>>,
 ) -> Result<FileResult, Box<dyn std::error::Error>> {
+    let normalized_storage;
+    let metadata: &AudioMetadata = if normalize {
+        normalized_storage = normalize_metadata(metadata, config);
+        if let Err(e) = write_normalized_tags(source_path, metadata, &normalized_storage) {
+            warn!(
+                "failed to write normalized tags for {}: {}",
+                source_path.display(),
+                e
+            );
+        }
+        &normalized_storage
+    } else {
+        metadata
+    };
+
     let relative_path = match generate_target_path(source_path, metadata, config, multi_disc_albums)
     {
         Some(path) => path,
@@ -558,12 +579,123 @@ fn create_metadata_key(metadata: &AudioMetadata) -> Option<MetadataKey> {
     })
 }
 
+fn remove_pattern_case_insensitive(value: &str, pattern: &str) -> String {
+    if pattern.is_empty() {
+        return value.to_string();
+    }
+
+    let lower_value = value.to_lowercase();
+    let lower_pattern = pattern.to_lowercase();
+    let mut result = String::with_capacity(value.len());
+    let mut last_end = 0;
+
+    for (start, _) in lower_value.match_indices(&lower_pattern) {
+        if start < last_end {
+            continue;
+        }
+        result.push_str(&value[last_end..start]);
+        last_end = start + pattern.len();
+    }
+    result.push_str(&value[last_end..]);
+
+    result
+}
+
 fn sanitize_metadata_value(value: &str, config: &Config) -> String {
     let mut sanitized = value.to_string();
     for (from, to) in &config.formatting.replace_chars {
         sanitized = sanitized.replace(from, to);
     }
     sanitized
+}
+
+fn normalize_metadata_value(value: &str, config: &Config) -> String {
+    let mut normalized = value.to_string();
+    for pattern in &config.formatting.normalize_patterns {
+        normalized = remove_pattern_case_insensitive(&normalized, pattern);
+    }
+    normalized.trim().to_string()
+}
+
+fn normalize_metadata(metadata: &AudioMetadata, config: &Config) -> AudioMetadata {
+    let mut normalized = metadata.clone();
+    normalized.title = metadata
+        .title
+        .as_deref()
+        .map(|v| normalize_metadata_value(v, config));
+    normalized.artist = metadata
+        .artist
+        .as_deref()
+        .map(|v| normalize_metadata_value(v, config));
+    normalized.album = metadata
+        .album
+        .as_deref()
+        .map(|v| normalize_metadata_value(v, config));
+    normalized.album_artist = metadata
+        .album_artist
+        .as_deref()
+        .map(|v| normalize_metadata_value(v, config));
+    normalized.genre = metadata
+        .genre
+        .as_deref()
+        .map(|v| normalize_metadata_value(v, config));
+    normalized
+}
+
+fn write_normalized_tags(
+    path: &Path,
+    original: &AudioMetadata,
+    normalized: &AudioMetadata,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let title_changed = original.title != normalized.title;
+    let artist_changed = original.artist != normalized.artist;
+    let album_changed = original.album != normalized.album;
+    let album_artist_changed = original.album_artist != normalized.album_artist;
+    let genre_changed = original.genre != normalized.genre;
+
+    if !(title_changed || artist_changed || album_changed || album_artist_changed || genre_changed)
+    {
+        return Ok(());
+    }
+
+    let mut tagged_file = lofty::read_from_path(path)?;
+    if tagged_file.primary_tag().is_none() {
+        let tag_type = tagged_file.primary_tag_type();
+        tagged_file.insert_tag(Tag::new(tag_type));
+    }
+    let tag = tagged_file
+        .primary_tag_mut()
+        .expect("a primary tag was just ensured");
+
+    if title_changed {
+        if let Some(ref v) = normalized.title {
+            tag.insert_text(ItemKey::TrackTitle, v.clone());
+        }
+    }
+    if artist_changed {
+        if let Some(ref v) = normalized.artist {
+            tag.insert_text(ItemKey::TrackArtist, v.clone());
+        }
+    }
+    if album_changed {
+        if let Some(ref v) = normalized.album {
+            tag.insert_text(ItemKey::AlbumTitle, v.clone());
+        }
+    }
+    if album_artist_changed {
+        if let Some(ref v) = normalized.album_artist {
+            tag.insert_text(ItemKey::AlbumArtist, v.clone());
+        }
+    }
+    if genre_changed {
+        if let Some(ref v) = normalized.genre {
+            tag.insert_text(ItemKey::Genre, v.clone());
+        }
+    }
+
+    tag.save_to_path(path, WriteOptions::default())?;
+
+    Ok(())
 }
 
 fn is_compilation(metadata: &AudioMetadata) -> bool {
