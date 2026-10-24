@@ -3,16 +3,16 @@ name = "ufrume"
 description = "A multithreaded CLI tool to organize your music from messy into a structured system defined by you."
 license = "GPL-3.0"
 authors = ["PandaDEV <contact@pandadev.net>"]
-version = "1.0.2"
+version = "1.2.0"
 edition = "2024"
 repository = "https://github.com/0PandaDEV/ufrume"
 
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
-toml = "1.1.6"
+toml = "1.1.8"
 dirs = "7.0.0"
 walkdir = "2.5.0"
-lofty = "0.25.2"
+lofty = "0.25.4"
 symphonia = { version = "0.6.1", features = ["all"] }
 ebur128 = "0.1.10"
 indicatif = "0.18.6"
@@ -22,3 +22,9 @@ clap = { version = "4.6.7", features = ["derive"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["blocking", "json", "rustls", "query"] }
+flate2 = "1.1.10"
+tar = "0.4.46"
+self-replace = "1.5.0"
+
+[target."cfg(windows)".dependencies]
+zip = { version = "9.1.0", default-features = false, features = ["deflate"] }

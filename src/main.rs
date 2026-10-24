@@ -9,6 +9,7 @@ mod organize;
 mod replaygain;
 mod scan;
 mod tag;
+mod update;
 
 use crate::config::load_or_create_config;
 use crate::organize::organize_music_files;
@@ -51,6 +52,8 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
     },
+
+    Update,
 }
 
 fn resolve_path(arg: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -214,6 +217,15 @@ fn run_tag(path: Option<PathBuf>, force: bool) {
     }
 }
 
+fn run_update() {
+    println!("{} Updating ufrume...", style("[1/1]").bold().dim());
+    if let Err(e) = update::run_update() {
+        error!("failed to update: {}", e);
+        eprintln!("ERROR: Failed to update: {}", e);
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     match logging::init() {
         Ok(log_path) => log_startup(&log_path),
@@ -222,12 +234,22 @@ fn main() {
 
     let cli = Cli::parse();
 
+    let update_check = match cli.command {
+        Commands::Update => None,
+        _ => update::start_check(),
+    };
+
     configure_threads(cli.threads);
 
     match cli.command {
         Commands::Organize { dir, normalize } => run_organize(dir, cli.verbose, normalize),
         Commands::Replaygain { path, force } => run_replaygain(path, force),
         Commands::Tag { path, force } => run_tag(path, force),
+        Commands::Update => run_update(),
+    }
+
+    if let Some(check) = update_check {
+        check.finish();
     }
 
     info!("done");
