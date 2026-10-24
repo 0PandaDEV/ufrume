@@ -210,7 +210,7 @@ pub fn apply_replaygain(path: &Path, force: bool) -> Result<(), Box<dyn Error>> 
 
 fn gain_from_loudness(loudness: f64) -> f64 {
     if loudness.is_finite() {
-        -18 as f64 - loudness
+        -18_f64 - loudness
     } else {
         0.0
     }

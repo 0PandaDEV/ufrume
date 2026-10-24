@@ -6,7 +6,7 @@ use lofty::prelude::*;
 use lofty::tag::{ItemKey, Tag};
 use rayon::prelude::*;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -266,17 +266,18 @@ fn organize_single_file(
                 disc: None,
             };
 
-            if metadata_map.contains_key(&fallback_key) {
-                match config.rules.handle_duplicates.as_str() {
+            match metadata_map.entry(fallback_key.clone()) {
+                Entry::Occupied(_) => match config.rules.handle_duplicates.as_str() {
                     "skip" => return Ok(FileResult::Duplicate),
                     "rename" => {
                         handle_duplicate_rename(&target_path, &fallback_key, &mut metadata_map)
                     }
                     _ => target_path,
+                },
+                Entry::Vacant(e) => {
+                    e.insert(source_path.clone());
+                    target_path
                 }
-            } else {
-                metadata_map.insert(fallback_key, source_path.clone());
-                target_path
             }
         }
     };
@@ -311,7 +312,7 @@ fn move_file(source_path: &Path, target_path: &Path) -> io::Result<()> {
 }
 
 fn generate_target_path(
-    source_path: &PathBuf,
+    source_path: &Path,
     metadata: &AudioMetadata,
     config: &Config,
     multi_disc_albums: &HashSet<(String, String)>,
@@ -332,7 +333,7 @@ fn generate_target_path(
     Some(PathBuf::from(sanitized_path))
 }
 
-fn generate_fallback_path(source_path: &PathBuf, config: &Config) -> PathBuf {
+fn generate_fallback_path(source_path: &Path, config: &Config) -> PathBuf {
     let filename = source_path
         .file_name()
         .unwrap_or_default()
@@ -349,7 +350,7 @@ fn generate_fallback_path(source_path: &PathBuf, config: &Config) -> PathBuf {
 
 fn replace_placeholders(
     template: &str,
-    source_path: &PathBuf,
+    source_path: &Path,
     metadata: &AudioMetadata,
     config: &Config,
     multi_disc_albums: &HashSet<(String, String)>,
@@ -392,19 +393,19 @@ fn replace_placeholders(
 
     if template.contains("{track") {
         if let Some(track) = metadata.track {
-            if let Some(start) = template.find("{track") {
-                if let Some(end) = template[start..].find('}') {
-                    let full_placeholder = &template[start..start + end + 1];
-                    if full_placeholder.contains(':') {
-                        let format_part = &full_placeholder[7..full_placeholder.len() - 1];
-                        if format_part == "02" {
-                            result = result.replace(full_placeholder, &format!("{:02}", track));
-                        } else {
-                            result = result.replace(full_placeholder, &track.to_string());
-                        }
+            if let Some(start) = template.find("{track")
+                && let Some(end) = template[start..].find('}')
+            {
+                let full_placeholder = &template[start..start + end + 1];
+                if full_placeholder.contains(':') {
+                    let format_part = &full_placeholder[7..full_placeholder.len() - 1];
+                    if format_part == "02" {
+                        result = result.replace(full_placeholder, &format!("{:02}", track));
                     } else {
-                        result = result.replace("{track}", &track.to_string());
+                        result = result.replace(full_placeholder, &track.to_string());
                     }
+                } else {
+                    result = result.replace("{track}", &track.to_string());
                 }
             }
         } else if template.contains("{track") {
@@ -412,7 +413,7 @@ fn replace_placeholders(
         }
     }
 
-    let is_multi_disc = metadata.disc.map_or(false, |_| {
+    let is_multi_disc = metadata.disc.is_some_and(|_| {
         let artist = metadata
             .album_artist
             .as_ref()
@@ -426,43 +427,42 @@ fn replace_placeholders(
     if template.contains("{disc") {
         if let Some(disc) = metadata.disc {
             if is_multi_disc {
-                if let Some(start) = template.find("{disc") {
-                    if let Some(end) = template[start..].find('}') {
-                        let full_placeholder = &template[start..start + end + 1];
-                        if full_placeholder.contains(':') {
-                            let format_part = &full_placeholder[7..full_placeholder.len() - 1];
-                            if format_part == "02" {
-                                result = result.replace(full_placeholder, &format!("{:02}", disc));
-                            } else {
-                                result = result.replace(full_placeholder, &disc.to_string());
-                            }
+                if let Some(start) = template.find("{disc")
+                    && let Some(end) = template[start..].find('}')
+                {
+                    let full_placeholder = &template[start..start + end + 1];
+                    if full_placeholder.contains(':') {
+                        let format_part = &full_placeholder[7..full_placeholder.len() - 1];
+                        if format_part == "02" {
+                            result = result.replace(full_placeholder, &format!("{:02}", disc));
                         } else {
-                            result = result.replace("{disc}", &format!("Disc {}", disc));
+                            result = result.replace(full_placeholder, &disc.to_string());
                         }
+                    } else {
+                        result = result.replace("{disc}", &format!("Disc {}", disc));
                     }
                 }
             } else {
-                if let Some(start) = template.find("{disc") {
-                    if let Some(end) = template[start..].find('}') {
-                        let full_placeholder = &template[start..start + end + 1];
-                        result = result.replace(&format!("/{}/", full_placeholder), "/");
-                        result = result.replace(&format!("/{}", full_placeholder), "");
-                        result = result.replace(&format!("{}/", full_placeholder), "");
-                        result = result.replace(full_placeholder, "");
-                    }
+                if let Some(start) = template.find("{disc")
+                    && let Some(end) = template[start..].find('}')
+                {
+                    let full_placeholder = &template[start..start + end + 1];
+                    result = result.replace(&format!("/{}/", full_placeholder), "/");
+                    result = result.replace(&format!("/{}", full_placeholder), "");
+                    result = result.replace(&format!("{}/", full_placeholder), "");
+                    result = result.replace(full_placeholder, "");
                 }
                 let _ = disc;
             }
         } else if template.contains("{disc") {
             return None;
         }
-    } else if let Some(disc) = metadata.disc {
-        if is_multi_disc {
-            if let Some(track_pos) = result.rfind('/') {
-                let after_slash = &result[track_pos + 1..];
-                result = format!("{}/Disc {}/{}", &result[..track_pos], disc, after_slash);
-            }
-        }
+    } else if let Some(disc) = metadata.disc
+        && is_multi_disc
+        && let Some(track_pos) = result.rfind('/')
+    {
+        let after_slash = &result[track_pos + 1..];
+        result = format!("{}/Disc {}/{}", &result[..track_pos], disc, after_slash);
     }
 
     if let Some(genre) = &metadata.genre {
@@ -479,10 +479,10 @@ fn replace_placeholders(
         result = result.replace("{filename}", &filename);
     }
 
-    if let Some(extension) = source_path.extension() {
-        if !result.ends_with(&format!(".{}", extension.to_string_lossy())) {
-            result = format!("{}.{}", result, extension.to_string_lossy());
-        }
+    if let Some(extension) = source_path.extension()
+        && !result.ends_with(&format!(".{}", extension.to_string_lossy()))
+    {
+        result = format!("{}.{}", result, extension.to_string_lossy());
     }
 
     Some(result)
@@ -529,7 +529,7 @@ fn sanitize_path(path: &str, config: &Config) -> String {
 }
 
 fn handle_duplicate_rename(
-    target_path: &PathBuf,
+    target_path: &Path,
     metadata_key: &MetadataKey,
     used_metadata: &mut HashMap<MetadataKey, PathBuf>,
 ) -> PathBuf {
@@ -551,8 +551,8 @@ fn handle_duplicate_rename(
         let mut new_metadata_key = metadata_key.clone();
         new_metadata_key.title = format!("{} ({})", metadata_key.title, counter);
 
-        if !used_metadata.contains_key(&new_metadata_key) {
-            used_metadata.insert(new_metadata_key, new_path.clone());
+        if let Entry::Vacant(e) = used_metadata.entry(new_metadata_key) {
+            e.insert(new_path.clone());
             return new_path;
         }
         counter += 1;
@@ -667,30 +667,20 @@ fn write_normalized_tags(
         .primary_tag_mut()
         .expect("a primary tag was just ensured");
 
-    if title_changed {
-        if let Some(ref v) = normalized.title {
-            tag.insert_text(ItemKey::TrackTitle, v.clone());
-        }
+    if title_changed && let Some(ref v) = normalized.title {
+        tag.insert_text(ItemKey::TrackTitle, v.clone());
     }
-    if artist_changed {
-        if let Some(ref v) = normalized.artist {
-            tag.insert_text(ItemKey::TrackArtist, v.clone());
-        }
+    if artist_changed && let Some(ref v) = normalized.artist {
+        tag.insert_text(ItemKey::TrackArtist, v.clone());
     }
-    if album_changed {
-        if let Some(ref v) = normalized.album {
-            tag.insert_text(ItemKey::AlbumTitle, v.clone());
-        }
+    if album_changed && let Some(ref v) = normalized.album {
+        tag.insert_text(ItemKey::AlbumTitle, v.clone());
     }
-    if album_artist_changed {
-        if let Some(ref v) = normalized.album_artist {
-            tag.insert_text(ItemKey::AlbumArtist, v.clone());
-        }
+    if album_artist_changed && let Some(ref v) = normalized.album_artist {
+        tag.insert_text(ItemKey::AlbumArtist, v.clone());
     }
-    if genre_changed {
-        if let Some(ref v) = normalized.genre {
-            tag.insert_text(ItemKey::Genre, v.clone());
-        }
+    if genre_changed && let Some(ref v) = normalized.genre {
+        tag.insert_text(ItemKey::Genre, v.clone());
     }
 
     tag.save_to_path(path, WriteOptions::default())?;

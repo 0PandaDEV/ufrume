@@ -96,11 +96,7 @@ fn run_organize(dir: Option<PathBuf>, verbose: bool, normalize: bool) {
         std::process::exit(1);
     }
 
-    println!(
-        "{} {}",
-        style("[1/3]").bold().dim(),
-        "Loading configuration..."
-    );
+    println!("{} Loading configuration...", style("[1/3]").bold().dim());
     let config = match load_or_create_config() {
         Ok(config) => config,
         Err(e) => {
@@ -114,11 +110,7 @@ fn run_organize(dir: Option<PathBuf>, verbose: bool, normalize: bool) {
     println!("  Directory: {}", style(dir.display()).green());
     println!("  Mode:      {}", style("Move (in-place)").cyan());
 
-    println!(
-        "{} {}",
-        style("[2/3]").bold().dim(),
-        "Scanning music files..."
-    );
+    println!("{} Scanning music files...", style("[2/3]").bold().dim());
 
     let music_files = match scan_for_music(&dir) {
         Ok(music_files) => {
@@ -139,9 +131,8 @@ fn run_organize(dir: Option<PathBuf>, verbose: bool, normalize: bool) {
     };
 
     println!(
-        "\n{} {}",
-        style("[3/3]").bold().dim(),
-        "Organizing music files..."
+        "\n{} Organizing music files...",
+        style("[3/3]").bold().dim()
     );
 
     if let Err(e) = organize_music_files(&music_files, &dir, &config, normalize) {
@@ -183,11 +174,7 @@ fn run_replaygain(path: Option<PathBuf>, force: bool) {
     }
 
     info!("computing ReplayGain for: {}", path.display());
-    println!(
-        "{} {}",
-        style("[1/1]").bold().dim(),
-        "Computing ReplayGain..."
-    );
+    println!("{} Computing ReplayGain...", style("[1/1]").bold().dim());
     println!("  Target: {}", style(path.display()).green());
 
     if let Err(e) = apply_replaygain(&path, force) {

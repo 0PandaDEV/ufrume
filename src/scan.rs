@@ -127,8 +127,7 @@ pub fn scan_for_music(
 
     let duration = start_time.elapsed();
 
-    let music_files: Vec<(PathBuf, AudioMetadata)> =
-        results.into_iter().filter_map(|r| r).collect();
+    let music_files: Vec<(PathBuf, AudioMetadata)> = results.into_iter().flatten().collect();
 
     let failed_count = *failed_extractions.lock().unwrap();
     if failed_count > 0 {
@@ -204,10 +203,10 @@ pub fn extract_first_artist(artist_string: &str) -> String {
     let mut earliest_pos = artist_string.len();
 
     for delimiter in &delimiters {
-        if let Some(pos) = artist_string.find(delimiter) {
-            if pos < earliest_pos {
-                earliest_pos = pos;
-            }
+        if let Some(pos) = artist_string.find(delimiter)
+            && pos < earliest_pos
+        {
+            earliest_pos = pos;
         }
     }
 
