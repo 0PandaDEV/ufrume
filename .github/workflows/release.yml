@@ -4,6 +4,10 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      base:
+        description: Previous tag or ref to compare from (defaults to the previous tag)
+        required: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,7 +29,7 @@ jobs:
         id: version
         run: |
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/tags/* ]]; then
-
+            VERSION="${GITHUB_REF_NAME}"
             echo "version=$VERSION" >> $GITHUB_OUTPUT
             echo "is_new_release=true" >> $GITHUB_OUTPUT
             echo "Version from tag: $VERSION"
@@ -61,13 +65,13 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: ufrume.exe
-            asset_name: ufrume-windows-x64.exe
+            asset_name: ufrume-windows-x64
             display_name: Windows x64
 
           - os: windows-latest
             target: aarch64-pc-windows-msvc
             artifact_name: ufrume.exe
-            asset_name: ufrume-windows-arm64.exe
+            asset_name: ufrume-windows-arm64
             display_name: Windows ARM64
 
           - os: macos-latest
@@ -127,18 +131,13 @@ jobs:
         run: |
           mkdir -p artifacts
 
-          if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.asset_name }}
-          else
-            cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.asset_name }}
-            chmod +x artifacts/${{ matrix.asset_name }}
-          fi
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} artifacts/${{ matrix.artifact_name }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset_name }}
-          path: artifacts/${{ matrix.asset_name }}
+          path: artifacts/${{ matrix.artifact_name }}
 
   release:
     name: Create Release
@@ -162,37 +161,37 @@ jobs:
 
           for dir in */; do
             platform=$(basename "$dir")
-            cd "$dir"
-            
-            if [[ "$platform" == *"windows"* ]]; then
 
-              zip "../${platform}.zip" *
+            if [[ "$platform" == *windows* ]]; then
+              (cd "$dir" && zip "../${platform}.zip" ufrume.exe)
             else
-
-              tar -czf "../${platform}.tar.gz" *
+              chmod +x "${dir}ufrume"
+              tar -czf "${platform}.tar.gz" -C "$dir" ufrume
             fi
-            
-            cd ..
           done
 
-      - name: Update CHANGELOG
+          sha256sum *.zip *.tar.gz > SHA256SUMS
+
+      - name: Changelog
         id: changelog
-        uses: requarks/changelog-action@v1
+        uses: 0PandaDEV/changelog@main
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          tag: ${{ needs.get-version.outputs.version }}
+          head: ${{ needs.get-version.outputs.version }}
+          base: ${{ github.event.inputs.base }}
+          step-summary: "true"
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.get-version.outputs.version }}
           name: ${{ needs.get-version.outputs.version }}
-          body: ${{ steps.changelog.outputs.changes }}
+          body: ${{ steps.changelog.outputs.markdown }}
           draft: false
           prerelease: false
           files: |
             artifacts/*.zip
             artifacts/*.tar.gz
+            artifacts/SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
