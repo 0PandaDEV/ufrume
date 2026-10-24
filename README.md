@@ -61,6 +61,16 @@ music/
 
 # Installation
 
+### Install script (Linux & macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/0PandaDEV/ufrume/main/scripts/install.sh | sh
+```
+
+Installs to `~/.local/bin` by default.
+
+Update later with `ufrume update`.
+
 ### From [crates.io](https://crates.io/crates/ufrume)
 
 ```bash
