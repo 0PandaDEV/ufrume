@@ -1,18 +1,91 @@
 use crate::scan::{collect_music_paths, is_music_file};
 
+use console::{Term, truncate_str};
 use indicatif::{ProgressBar, ProgressStyle};
 use lofty::config::WriteOptions;
 use lofty::prelude::*;
 use lofty::tag::{ItemKey, Tag};
-use std::io::{self, Write};
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::thread::sleep;
+use std::time::{Duration, SystemTime};
 use tracing::{debug, warn};
 
-const MUSICBRAINZ_WS: &str = "https://musicbrainz.org/ws/2";
-const USER_AGENT: &str = "ufrume/1.0 (https://github.com/0PandaDEV/ufrume)";
+const OMM_API: &str = "https://api.vleer.app/metadata/v1";
+const MAX_ATTEMPTS: u32 = 3;
+const PROGRESS_PREFIX_WIDTH: usize = 75;
+const MAX_PARAM_CHARS: usize = 256;
 
-fn has_musicbrainz_tags(path: &Path) -> bool {
+struct ExistingMeta {
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    duration_ms: Option<u128>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OmmResponse {
+    data: OmmSong,
+}
+
+#[derive(Debug, Deserialize)]
+struct OmmSong {
+    attributes: OmmSongAttributes,
+    relationships: Option<OmmSongRelationships>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OmmSongAttributes {
+    name: String,
+    album_name: Option<String>,
+    #[serde(default)]
+    artist_names: Vec<String>,
+    isrc: Option<String>,
+    track_number: Option<u32>,
+    disc_number: Option<u32>,
+    genres: Option<Vec<String>>,
+    release_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OmmSongRelationships {
+    albums: Option<OmmAlbumList>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OmmAlbumList {
+    data: Vec<OmmAlbum>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OmmAlbum {
+    attributes: OmmAlbumAttributes,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OmmAlbumAttributes {
+    name: String,
+    #[serde(default)]
+    artist_names: Vec<String>,
+    release_date: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TagCandidate {
+    title: String,
+    artists: Vec<String>,
+    album: Option<String>,
+    album_artists: Vec<String>,
+    date: Option<String>,
+    track: Option<u32>,
+    disc: Option<u32>,
+    genre: Option<String>,
+    isrc: Option<String>,
+}
+
+fn has_omm_tags(path: &Path) -> bool {
     let Ok(tagged_file) = lofty::read_from_path(path) else {
         return false;
     };
@@ -22,13 +95,14 @@ fn has_musicbrainz_tags(path: &Path) -> bool {
     else {
         return false;
     };
-    tag.get_string(ItemKey::MusicBrainzRecordingId)
+    tag.get_string(ItemKey::Isrc)
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false)
 }
 
 fn read_existing_metadata(path: &Path) -> Option<ExistingMeta> {
     let tagged_file = lofty::read_from_path(path).ok()?;
+    let duration_ms = Some(tagged_file.properties().duration().as_millis()).filter(|d| *d > 0);
     let tag = tagged_file
         .primary_tag()
         .or_else(|| tagged_file.first_tag())?;
@@ -45,271 +119,126 @@ fn read_existing_metadata(path: &Path) -> Option<ExistingMeta> {
         title,
         artist,
         album,
+        duration_ms,
     })
 }
 
-struct ExistingMeta {
-    title: Option<String>,
-    artist: Option<String>,
-    album: Option<String>,
+fn truncate_param(value: &str) -> String {
+    value.chars().take(MAX_PARAM_CHARS).collect()
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct MbSearchResponse {
-    recordings: Option<Vec<MbSearchRecording>>,
-}
+fn song_to_candidate(song: OmmSong) -> TagCandidate {
+    let attrs = song.attributes;
+    let album = song
+        .relationships
+        .and_then(|r| r.albums)
+        .and_then(|a| a.data.into_iter().next())
+        .map(|a| a.attributes);
 
-#[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)]
-struct MbSearchRecording {
-    id: String,
-    title: Option<String>,
-    score: f64,
-    #[serde(rename = "first-release-date")]
-    first_release_date: Option<String>,
-    #[serde(rename = "artist-credit")]
-    artist_credit: Option<Vec<MbSearchArtistCredit>>,
-    releases: Option<Vec<MbSearchRelease>>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct MbSearchArtistCredit {
-    name: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[allow(dead_code)]
-struct MbSearchRelease {
-    title: Option<String>,
-    date: Option<String>,
-    medium: Option<Vec<MbSearchMedium>>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct MbSearchMedium {
-    track: Option<Vec<MbSearchTrack>>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct MbSearchTrack {
-    number: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct TagCandidate {
-    title: Option<String>,
-    artist: Option<String>,
-    album: Option<String>,
-    album_artist: Option<String>,
-    year: Option<u32>,
-    track: Option<u16>,
-    genre: Option<String>,
-    musicbrainz_recording_id: Option<String>,
-    score: f64,
-    source: String,
-}
-
-fn search_musicbrainz(
-    query: &str,
-    client: &reqwest::blocking::Client,
-) -> Result<Vec<MbSearchRecording>, Box<dyn std::error::Error>> {
-    let url = format!("{}/recording", MUSICBRAINZ_WS);
-    let response = client
-        .get(&url)
-        .query(&[("query", query), ("fmt", "json"), ("limit", "10")])
-        .send()?;
-
-    if !response.status().is_success() {
-        return Ok(Vec::new());
-    }
-
-    let body: MbSearchResponse = response.json()?;
-    Ok(body.recordings.unwrap_or_default())
-}
-
-fn mb_recording_to_candidate(rec: &MbSearchRecording) -> TagCandidate {
-    let artist = rec
-        .artist_credit
-        .as_ref()
-        .and_then(|ac| ac.first())
-        .and_then(|ac| ac.name.clone());
-
-    let (album, year, track) = if let Some(releases) = &rec.releases {
-        let first = releases.first();
-        let album_title = first.and_then(|r| r.title.clone());
-        let year = first
-            .and_then(|r| r.date.as_ref())
-            .and_then(|d| d.split('-').next())
-            .and_then(|y| y.parse::<u32>().ok());
-        let track = first
-            .and_then(|r| r.medium.as_ref())
-            .and_then(|m| m.first())
-            .and_then(|m| m.track.as_ref())
-            .and_then(|t| t.first())
-            .and_then(|t| t.number.as_ref())
-            .and_then(|n| n.parse::<u16>().ok());
-        (album_title, year, track)
-    } else {
-        let year = rec
-            .first_release_date
-            .as_ref()
-            .and_then(|d| d.split('-').next())
-            .and_then(|y| y.parse::<u32>().ok());
-        (None, year, None)
+    let (album_name, album_artists, album_date) = match album {
+        Some(a) => (Some(a.name), a.artist_names, a.release_date),
+        None => (None, Vec::new(), None),
     };
 
     TagCandidate {
-        title: rec.title.clone(),
-        artist,
-        album,
-        album_artist: None,
-        year,
-        track,
-        genre: None,
-        musicbrainz_recording_id: Some(rec.id.clone()),
-        score: rec.score,
-        source: "MusicBrainz".to_string(),
+        title: attrs.name,
+        artists: attrs.artist_names,
+        album: attrs.album_name.or(album_name),
+        album_artists,
+        date: attrs.release_date.or(album_date),
+        track: attrs.track_number,
+        disc: attrs.disc_number,
+        genre: attrs.genres.filter(|g| !g.is_empty()).map(|g| g.join("; ")),
+        isrc: attrs.isrc,
     }
 }
 
-fn candidate_match_score(
-    candidate: &TagCandidate,
-    existing_artist: Option<&str>,
-    existing_title: Option<&str>,
-) -> f64 {
-    let mut score = 0.0;
+fn identify_song(
+    meta: &ExistingMeta,
+    title: &str,
+    client: &reqwest::blocking::Client,
+) -> Result<Option<TagCandidate>, Box<dyn std::error::Error>> {
+    let mut query: Vec<(&str, String)> = vec![("name", truncate_param(title))];
+    if let Some(ref artist) = meta.artist {
+        query.push(("artist", truncate_param(artist)));
+    }
+    if let Some(ref album) = meta.album {
+        query.push(("album", truncate_param(album)));
+    }
+    if let Some(duration) = meta.duration_ms {
+        query.push(("duration", duration.to_string()));
+    }
 
-    if let Some(ref ea) = existing_artist {
-        if let Some(ref ca) = candidate.artist {
-            if ca.to_lowercase() == ea.to_lowercase() {
-                score += 100.0;
-            } else if ca.to_lowercase().contains(&ea.to_lowercase())
-                || ea.to_lowercase().contains(&ca.to_lowercase())
-            {
-                score += 50.0;
+    let url = format!("{}/identify/song", OMM_API);
+
+    let mut last_status = None;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let response = client.get(&url).query(&query).send()?;
+        let status = response.status();
+
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            last_status = Some(status);
+            if attempt == MAX_ATTEMPTS {
+                break;
             }
-        }
-    }
-
-    if let Some(ref et) = existing_title {
-        if let Some(ref ct) = candidate.title {
-            if ct.to_lowercase() == et.to_lowercase() {
-                score += 100.0;
-            } else if ct.to_lowercase().contains(&et.to_lowercase())
-                || et.to_lowercase().contains(&ct.to_lowercase())
-            {
-                score += 50.0;
-            }
-        }
-    }
-
-    if let Some(ref ca) = candidate.album {
-        if let Some(ref ea) = existing_artist {
-            if ca.to_lowercase().contains(&ea.to_lowercase()) {
-                score += 10.0;
-            }
-        }
-    }
-
-    score
-}
-
-fn select_candidate(
-    candidates: &[TagCandidate],
-    rel_path: &str,
-    existing: Option<&ExistingMeta>,
-) -> Option<TagCandidate> {
-    if candidates.is_empty() {
-        return None;
-    }
-
-    if candidates.len() == 1 && candidates[0].score >= 0.8 {
-        return Some(candidates[0].clone());
-    }
-
-    println!();
-    println!(
-        "  {} {}",
-        console::style("File:").bold(),
-        console::style(rel_path).cyan()
-    );
-
-    if let Some(meta) = existing {
-        println!(
-            "  {} {}",
-            console::style("Current tags:").bold(),
-            [
-                meta.artist.as_deref().map(|v| format!("artist={}", v)),
-                meta.title.as_deref().map(|v| format!("title={}", v)),
-                meta.album.as_deref().map(|v| format!("album={}", v)),
-            ]
-            .iter()
-            .filter_map(|x| x.clone())
-            .collect::<Vec<String>>()
-            .join(", ")
-        );
-    } else {
-        println!("  {}", console::style("Current tags: (none)").bold());
-    }
-
-    println!("  {}", console::style("0: Skip").dim());
-
-    for (i, c) in candidates.iter().enumerate() {
-        let artist = c.artist.as_deref().unwrap_or("Unknown");
-        let title = c.title.as_deref().unwrap_or("Unknown");
-        let album = c.album.as_deref().unwrap_or("?");
-        let year = c
-            .year
-            .map(|y| y.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        let track = c
-            .track
-            .map(|t| t.to_string())
-            .unwrap_or_else(|| "?".to_string());
-
-        println!(
-            "  {}: {} - {} [{}] ({}) track {}",
-            console::style(i + 1).green().bold(),
-            console::style(artist).yellow(),
-            console::style(title).yellow(),
-            console::style(album).dim(),
-            console::style(year).dim(),
-            console::style(track).dim(),
-        );
-    }
-
-    loop {
-        print!("\n  {}: ", console::style("Enter number").bold());
-        io::stdout().flush().ok();
-
-        let mut input = String::new();
-        match io::stdin().read_line(&mut input) {
-            Ok(0) => return None,
-            Ok(_) => {}
-            Err(_) => return None,
-        }
-
-        let input = input.trim();
-        if input.is_empty() {
+            let wait = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(u64::from(attempt));
+            sleep(Duration::from_secs(wait.clamp(1, 30)));
             continue;
         }
 
-        let choice: usize = match input.parse() {
-            Ok(n) => n,
-            Err(_) => {
-                println!("  {}", console::style("Invalid number").red());
-                continue;
-            }
-        };
+        if status == reqwest::StatusCode::NOT_FOUND || status == reqwest::StatusCode::BAD_REQUEST {
+            return Ok(None);
+        }
 
-        if choice == 0 {
-            return None;
+        if !status.is_success() {
+            return Err(format!("API returned {}", status.as_u16()).into());
         }
-        if choice <= candidates.len() {
-            return Some(candidates[choice - 1].clone());
-        }
-        println!("  {}", console::style("Invalid number").red());
+
+        let body: OmmResponse = response.json()?;
+        return Ok(Some(song_to_candidate(body.data)));
+    }
+
+    let code = last_status.map(|s| s.as_u16()).unwrap_or_default();
+    Err(format!("API unavailable ({})", code).into())
+}
+
+fn fit(text: &str, reserved: usize) -> String {
+    let width = Term::stdout().size().1 as usize;
+    truncate_str(text, width.saturating_sub(reserved).max(20), "…").into_owned()
+}
+
+fn names_match(a: &str, b: &str) -> bool {
+    let a = a.trim().to_lowercase();
+    let b = b.trim().to_lowercase();
+    !a.is_empty() && !b.is_empty() && (a == b || a.contains(&b) || b.contains(&a))
+}
+
+fn prioritize_artist(names: &mut [String], preferred: &str) {
+    if let Some(pos) = names
+        .iter()
+        .position(|n| names_match(n, preferred) || names_match(preferred, n))
+    {
+        names[..=pos].rotate_right(1);
+    }
+}
+
+fn candidate_matches(candidate: &TagCandidate, existing: &ExistingMeta, title: &str) -> bool {
+    if !names_match(&candidate.title, title) {
+        return false;
+    }
+
+    match existing.artist.as_deref() {
+        Some(artist) if !candidate.artists.is_empty() => candidate
+            .artists
+            .iter()
+            .any(|name| names_match(name, artist) || names_match(artist, name)),
+        _ => true,
     }
 }
 
@@ -327,26 +256,30 @@ fn write_metadata_tags(
         .primary_tag_mut()
         .expect("a primary tag was just ensured");
 
-    if let Some(ref title) = candidate.title {
-        tag.insert_text(ItemKey::TrackTitle, title.clone());
-    }
-    if let Some(ref artist) = candidate.artist {
-        tag.insert_text(ItemKey::TrackArtist, artist.clone());
+    tag.insert_text(ItemKey::TrackTitle, candidate.title.clone());
+    if !candidate.artists.is_empty() {
+        tag.insert_text(ItemKey::TrackArtist, candidate.artists.join(", "));
     }
     if let Some(ref album) = candidate.album {
         tag.insert_text(ItemKey::AlbumTitle, album.clone());
     }
-    if let Some(ref album_artist) = candidate.album_artist {
-        tag.insert_text(ItemKey::AlbumArtist, album_artist.clone());
+    if !candidate.album_artists.is_empty() {
+        tag.insert_text(ItemKey::AlbumArtist, candidate.album_artists.join(", "));
     }
-    if let Some(year) = candidate.year {
-        tag.insert_text(ItemKey::RecordingDate, year.to_string());
+    if let Some(ref date) = candidate.date {
+        tag.insert_text(ItemKey::RecordingDate, date.clone());
     }
     if let Some(track) = candidate.track {
         tag.insert_text(ItemKey::TrackNumber, track.to_string());
     }
-    if let Some(ref mbid) = candidate.musicbrainz_recording_id {
-        tag.insert_text(ItemKey::MusicBrainzRecordingId, mbid.clone());
+    if let Some(disc) = candidate.disc {
+        tag.insert_text(ItemKey::DiscNumber, disc.to_string());
+    }
+    if let Some(ref genre) = candidate.genre {
+        tag.insert_text(ItemKey::Genre, genre.clone());
+    }
+    if let Some(ref isrc) = candidate.isrc {
+        tag.insert_text(ItemKey::Isrc, isrc.clone());
     }
 
     tag.save_to_path(path, WriteOptions::default())?;
@@ -381,7 +314,11 @@ pub fn tag_music_files(path: &Path, force: bool) -> Result<(), Box<dyn std::erro
     });
 
     let client = reqwest::blocking::Client::builder()
-        .user_agent(USER_AGENT)
+        .user_agent(format!(
+            "ufrume/{} (https://github.com/0PandaDEV/ufrume)",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .timeout(Duration::from_secs(30))
         .build()?;
 
     let pb = ProgressBar::new(sorted_files.len() as u64);
@@ -402,15 +339,15 @@ pub fn tag_music_files(path: &Path, force: bool) -> Result<(), Box<dyn std::erro
             .to_string_lossy()
             .to_string();
 
-        pb.set_message(rel_path.clone());
+        pb.set_message(fit(&rel_path, PROGRESS_PREFIX_WIDTH));
 
-        if !force && has_musicbrainz_tags(file) {
+        if !force && has_omm_tags(file) {
             skipped_count += 1;
             pb.inc(1);
             continue;
         }
 
-        match process_file(file, &rel_path, &client) {
+        match process_file(file, &client) {
             Ok(true) => {
                 tagged_count += 1;
             }
@@ -419,7 +356,8 @@ pub fn tag_music_files(path: &Path, force: bool) -> Result<(), Box<dyn std::erro
             }
             Err(e) => {
                 warn!("failed to tag {}: {}", file.display(), e);
-                eprintln!("  Failed to tag {}: {}", file.display(), e);
+                let name = file.file_name().unwrap_or_default().to_string_lossy();
+                pb.println(fit(&format!("  Failed: {} - {}", name, e), 0));
                 failed_count += 1;
             }
         }
@@ -441,88 +379,37 @@ pub fn tag_music_files(path: &Path, force: bool) -> Result<(), Box<dyn std::erro
 
 fn process_file(
     path: &Path,
-    rel_path: &str,
     client: &reqwest::blocking::Client,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let existing = read_existing_metadata(path);
+    let Some(existing) = read_existing_metadata(path) else {
+        debug!("no usable tags in {}", path.display());
+        return Ok(false);
+    };
+    let Some(title) = existing.title.clone().filter(|t| !t.trim().is_empty()) else {
+        debug!("no title in {}", path.display());
+        return Ok(false);
+    };
 
-    let mut candidates: Vec<TagCandidate> = Vec::new();
+    let Some(candidate) = identify_song(&existing, &title, client)? else {
+        debug!("no match for {}", path.display());
+        return Ok(false);
+    };
 
-    if let Some(ref meta) = existing {
-        if let Some(ref title) = meta.title {
-            let query = match (&meta.artist, &meta.album) {
-                (Some(artist), Some(album)) => {
-                    format!(
-                        "recording:\"{}\" AND artist:\"{}\" AND release:\"{}\"",
-                        title, artist, album
-                    )
-                }
-                (Some(artist), None) => {
-                    format!("recording:\"{}\" AND artist:\"{}\"", title, artist)
-                }
-                (None, Some(album)) => {
-                    format!("recording:\"{}\" AND release:\"{}\"", title, album)
-                }
-                (None, None) => {
-                    format!("recording:\"{}\"", title)
-                }
-            };
-
-            let results = search_musicbrainz(&query, client)?;
-            for rec in &results {
-                candidates.push(mb_recording_to_candidate(rec));
-            }
-
-            if candidates.is_empty() {
-                if let Some(ref artist) = meta.artist {
-                    let query = format!("recording:\"{}\" AND artist:\"{}\"", title, artist);
-                    let results = search_musicbrainz(&query, client)?;
-                    for rec in &results {
-                        candidates.push(mb_recording_to_candidate(rec));
-                    }
-                }
-            }
-
-            if candidates.is_empty() {
-                let query = format!("recording:\"{}\"", title);
-                let results = search_musicbrainz(&query, client)?;
-                for rec in &results {
-                    candidates.push(mb_recording_to_candidate(rec));
-                }
-            }
-        }
-    }
-
-    if candidates.is_empty() {
-        debug!("no candidates for {}", path.display());
+    if !candidate_matches(&candidate, &existing, &title) {
+        debug!(
+            "rejected mismatched match '{}' for {}",
+            candidate.title,
+            path.display()
+        );
         return Ok(false);
     }
 
-    candidates.sort_by(|a, b| {
-        let existing_artist = existing
-            .as_ref()
-            .and_then(|e| e.artist.as_deref())
-            .map(|s| s.to_lowercase());
-        let existing_title = existing
-            .as_ref()
-            .and_then(|e| e.title.as_deref())
-            .map(|s| s.to_lowercase());
+    let mut candidate = candidate;
+    if let Some(ref artist) = existing.artist {
+        prioritize_artist(&mut candidate.artists, artist);
+        prioritize_artist(&mut candidate.album_artists, artist);
+    }
 
-        let score_a =
-            candidate_match_score(a, existing_artist.as_deref(), existing_title.as_deref());
-        let score_b =
-            candidate_match_score(b, existing_artist.as_deref(), existing_title.as_deref());
-        score_b
-            .partial_cmp(&score_a)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    candidates.truncate(10);
-
-    let chosen = match select_candidate(&candidates, rel_path, existing.as_ref()) {
-        Some(c) => c,
-        None => return Ok(false),
-    };
-
-    write_metadata_tags(path, &chosen)?;
+    write_metadata_tags(path, &candidate)?;
     Ok(true)
 }

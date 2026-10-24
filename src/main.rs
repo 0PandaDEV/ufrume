@@ -202,9 +202,8 @@ fn run_tag(path: Option<PathBuf>, force: bool) {
 
     info!("tagging files in: {}", path.display());
     println!(
-        "{} {}",
-        style("[1/1]").bold().dim(),
-        "Tagging music files via MusicBrainz..."
+        "{} Tagging music files via OpenMusicMetadata...",
+        style("[1/1]").bold().dim()
     );
     println!("  Target: {}", style(path.display()).green());
 
