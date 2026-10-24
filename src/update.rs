@@ -256,10 +256,12 @@ fn extract_binary(archive: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>>
         if !file.is_file() {
             continue;
         }
-        let is_bin = Path::new(file.name())
+        let name = file.name()?;
+        let is_bin = Path::new(&*name)
             .file_name()
             .map(|n| n == BIN_NAME)
             .unwrap_or(false);
+        drop(name);
         let mut buf = Vec::new();
         file.read_to_end(&mut buf)?;
         if is_bin {
