@@ -66,13 +66,7 @@ pub fn organize_music_files(
             .progress_chars("█▉▊▋▌▍▎▏  "),
     );
 
-    let moved = Arc::new(Mutex::new(0));
-    let skipped = Arc::new(Mutex::new(0));
-    let failed = Arc::new(Mutex::new(0));
-    let duplicates = Arc::new(Mutex::new(0));
-
-    let used_metadata: Arc<Mutex<HashMap<MetadataKey, PathBuf>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let failed = Arc::new(Mutex::new(0usize));
 
     let multi_disc_albums: HashSet<(String, String)> = {
         let mut disc_counts: HashMap<(String, String), HashSet<u16>> = HashMap::new();
@@ -98,39 +92,52 @@ pub fn organize_music_files(
     };
     let multi_disc_albums = Arc::new(multi_disc_albums);
 
-    sorted_files.par_iter().for_each(|(source_path, metadata)| {
-        if let Some(filename) = source_path.file_name() {
-            pb.set_message(filename.to_string_lossy().to_string());
-        }
-
-        match organize_single_file(
-            source_path,
-            metadata,
-            output_dir,
-            config,
-            normalize,
-            &used_metadata,
-            &multi_disc_albums,
-        ) {
-            Ok(result) => match result {
-                FileResult::Moved => {
-                    *moved.lock().unwrap() += 1;
-                }
-                FileResult::Skipped => {
-                    *skipped.lock().unwrap() += 1;
-                }
-                FileResult::Duplicate => {
-                    *duplicates.lock().unwrap() += 1;
-                }
-            },
-            Err(e) => {
-                warn!("failed to organize {}: {}", source_path.display(), e);
-                *failed.lock().unwrap() += 1;
+    let planned: Vec<Option<Planned>> = sorted_files
+        .par_iter()
+        .map(|(source_path, metadata)| {
+            if let Some(filename) = source_path.file_name() {
+                pb.set_message(filename.to_string_lossy().to_string());
             }
-        }
 
-        pb.inc(1);
-    });
+            let plan = plan_file(
+                source_path,
+                metadata,
+                output_dir,
+                config,
+                normalize,
+                &multi_disc_albums,
+            );
+            pb.inc(1);
+
+            match plan {
+                Ok(plan) => plan,
+                Err(e) => {
+                    warn!("failed to organize {}: {}", source_path.display(), e);
+                    *failed.lock().unwrap() += 1;
+                    None
+                }
+            }
+        })
+        .collect();
+
+    let missing = planned.iter().filter(|p| p.is_none()).count();
+    let planned: Vec<Planned> = planned.into_iter().flatten().collect();
+
+    let Resolution {
+        moves,
+        stayed,
+        duplicates,
+        removals,
+    } = resolve_plan(&planned, config);
+
+    for path in removals {
+        if let Err(e) = fs::remove_file(&path) {
+            warn!("failed to remove {}: {}", path.display(), e);
+        }
+    }
+
+    let (moved, blocked, move_failures) = execute_moves(moves, &config.rules.handle_duplicates);
+    *failed.lock().unwrap() += move_failures;
 
     pb.finish_and_clear();
 
@@ -138,10 +145,10 @@ pub fn organize_music_files(
 
     let duration = start_time.elapsed();
     let result = OrganizeResult {
-        moved: *moved.lock().unwrap(),
-        skipped: *skipped.lock().unwrap(),
+        moved,
+        skipped: stayed + missing,
         failed: *failed.lock().unwrap(),
-        duplicates: *duplicates.lock().unwrap(),
+        duplicates: duplicates + blocked,
     };
 
     info!(
@@ -171,22 +178,28 @@ pub fn organize_music_files(
     Ok(result)
 }
 
-#[derive(Debug)]
-enum FileResult {
-    Moved,
-    Skipped,
-    Duplicate,
+struct Planned {
+    source: PathBuf,
+    target: PathBuf,
+    key: MetadataKey,
+    fallback: bool,
 }
 
-fn organize_single_file(
-    source_path: &PathBuf,
+struct Resolution {
+    moves: Vec<(PathBuf, PathBuf)>,
+    stayed: usize,
+    duplicates: usize,
+    removals: Vec<PathBuf>,
+}
+
+fn plan_file(
+    source_path: &Path,
     metadata: &AudioMetadata,
     output_dir: &Path,
     config: &Config,
     normalize: bool,
-    used_metadata: &Arc<Mutex<HashMap<MetadataKey, PathBuf>>>,
     multi_disc_albums: &Arc<HashSet<(String, String)>>,
-) -> Result<FileResult, Box<dyn std::error::Error>> {
+) -> Result<Option<Planned>, Box<dyn std::error::Error>> {
     let normalized_storage;
     let metadata: &AudioMetadata = if normalize {
         normalized_storage = normalize_metadata(metadata, config);
@@ -207,14 +220,14 @@ fn organize_single_file(
         Some(path) => path,
         None => {
             if config.rules.handle_missing_metadata == "skip" {
-                return Ok(FileResult::Skipped);
+                return Ok(None);
             } else {
                 generate_fallback_path(source_path, config)
             }
         }
     };
 
-    let target_path = if source_path.starts_with(output_dir) {
+    let target = if source_path.starts_with(output_dir) {
         let dir_name = output_dir.file_name().unwrap_or_default().to_string_lossy();
         let template_str = relative_path.to_string_lossy();
         let stripped = if template_str.starts_with(&*format!("{}/", dir_name)) {
@@ -227,34 +240,10 @@ fn organize_single_file(
         output_dir.join(&relative_path)
     };
 
-    let final_target_path = {
-        let metadata_key = create_metadata_key(metadata);
-        let mut metadata_map = used_metadata.lock().unwrap();
-
-        if let Some(metadata_key) = metadata_key {
-            if metadata_map.contains_key(&metadata_key) {
-                match config.rules.handle_duplicates.as_str() {
-                    "skip" => {
-                        return Ok(FileResult::Duplicate);
-                    }
-                    "rename" => {
-                        handle_duplicate_rename(&target_path, &metadata_key, &mut metadata_map)
-                    }
-                    "overwrite" => {
-                        if let Some(old_path) = metadata_map.get(&metadata_key) {
-                            let _ = fs::remove_file(old_path);
-                        }
-                        metadata_map.insert(metadata_key, source_path.clone());
-                        target_path
-                    }
-                    _ => target_path,
-                }
-            } else {
-                metadata_map.insert(metadata_key, source_path.clone());
-                target_path
-            }
-        } else {
-            let fallback_key = MetadataKey {
+    let (key, fallback) = match create_metadata_key(metadata) {
+        Some(key) => (key, false),
+        None => (
+            MetadataKey {
                 artist: "Unknown".to_string(),
                 album: "Unknown".to_string(),
                 title: source_path
@@ -264,36 +253,180 @@ fn organize_single_file(
                     .to_string(),
                 track: None,
                 disc: None,
-            };
+            },
+            true,
+        ),
+    };
 
-            match metadata_map.entry(fallback_key.clone()) {
-                Entry::Occupied(_) => match config.rules.handle_duplicates.as_str() {
-                    "skip" => return Ok(FileResult::Duplicate),
-                    "rename" => {
-                        handle_duplicate_rename(&target_path, &fallback_key, &mut metadata_map)
+    Ok(Some(Planned {
+        source: source_path.to_path_buf(),
+        target,
+        key,
+        fallback,
+    }))
+}
+
+fn resolve_plan(planned: &[Planned], config: &Config) -> Resolution {
+    let policy = config.rules.handle_duplicates.as_str();
+
+    let mut order: Vec<usize> = (0..planned.len()).collect();
+    order.sort_by_key(|&i| planned[i].source != planned[i].target);
+
+    let index_of: HashMap<&Path, usize> = planned
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.source.as_path(), i))
+        .collect();
+
+    let mut used_keys: HashMap<MetadataKey, PathBuf> = HashMap::new();
+    let mut claimed: HashMap<PathBuf, usize> = HashMap::new();
+    let mut cancelled: HashSet<usize> = HashSet::new();
+    let mut moves: Vec<(usize, PathBuf)> = Vec::new();
+    let mut stayed = 0;
+    let mut duplicates = 0;
+    let mut removals = Vec::new();
+
+    for i in order {
+        let plan = &planned[i];
+        let mut target = plan.target.clone();
+
+        if used_keys.contains_key(&plan.key) {
+            match policy {
+                "skip" => {
+                    duplicates += 1;
+                    continue;
+                }
+                "rename" => {
+                    target = handle_duplicate_rename(&target, &plan.key, &mut used_keys);
+                }
+                "overwrite" if !plan.fallback => {
+                    if let Some(old) = used_keys.get(&plan.key)
+                        && let Some(&old_index) = index_of.get(old.as_path())
+                    {
+                        cancelled.insert(old_index);
+                        removals.push(old.clone());
                     }
-                    _ => target_path,
-                },
-                Entry::Vacant(e) => {
-                    e.insert(source_path.clone());
-                    target_path
+                    used_keys.insert(plan.key.clone(), plan.source.clone());
+                }
+                _ => {}
+            }
+        } else {
+            used_keys.insert(plan.key.clone(), plan.source.clone());
+        }
+
+        if target == plan.source {
+            claimed.insert(target, i);
+            stayed += 1;
+            continue;
+        }
+
+        let occupied_elsewhere = claimed.contains_key(&target)
+            || (target.exists() && !index_of.contains_key(target.as_path()));
+        if occupied_elsewhere {
+            match policy {
+                "overwrite" => {}
+                "rename" => {
+                    target = first_free_path_excluding(&target, &claimed);
+                }
+                _ => {
+                    duplicates += 1;
+                    continue;
                 }
             }
         }
-    };
 
-    if final_target_path == *source_path {
-        return Ok(FileResult::Skipped);
+        claimed.insert(target.clone(), i);
+        moves.push((i, target));
     }
 
-    move_file(source_path, &final_target_path)?;
-    debug!(
-        "moved {} -> {}",
-        source_path.display(),
-        final_target_path.display()
-    );
+    let moves = moves
+        .into_iter()
+        .filter(|(i, _)| !cancelled.contains(i))
+        .map(|(i, target)| (planned[i].source.clone(), target))
+        .collect();
 
-    Ok(FileResult::Moved)
+    Resolution {
+        moves,
+        stayed,
+        duplicates,
+        removals,
+    }
+}
+
+fn execute_moves(mut pending: Vec<(PathBuf, PathBuf)>, policy: &str) -> (usize, usize, usize) {
+    let mut moved = 0;
+    let mut failures = 0;
+
+    loop {
+        let mut progressed = false;
+        let mut remaining = Vec::new();
+
+        for (source, target) in pending {
+            if target.exists() && policy != "overwrite" {
+                remaining.push((source, target));
+                continue;
+            }
+            match move_file(&source, &target) {
+                Ok(()) => {
+                    debug!("moved {} -> {}", source.display(), target.display());
+                    moved += 1;
+                    progressed = true;
+                }
+                Err(e) => {
+                    warn!("failed to move {}: {}", source.display(), e);
+                    failures += 1;
+                }
+            }
+        }
+
+        pending = remaining;
+        if pending.is_empty() {
+            break;
+        }
+        if progressed {
+            continue;
+        }
+
+        let blocker = pending.iter().enumerate().find_map(|(i, (_, target))| {
+            pending
+                .iter()
+                .position(|(source, _)| source == target)
+                .filter(|&j| j != i)
+        });
+        let Some(j) = blocker else {
+            break;
+        };
+
+        let (source, _) = &pending[j];
+        let parked = source.with_file_name(format!(".ufrume-moving-{}-{}", std::process::id(), j));
+        match fs::rename(source, &parked) {
+            Ok(()) => pending[j].0 = parked,
+            Err(e) => {
+                warn!("failed to park {}: {}", source.display(), e);
+                failures += 1;
+                pending.remove(j);
+            }
+        }
+    }
+
+    (moved, pending.len(), failures)
+}
+
+fn first_free_path_excluding(target_path: &Path, claimed: &HashMap<PathBuf, usize>) -> PathBuf {
+    let stem = target_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let extension = target_path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    let parent = target_path.parent().unwrap_or(Path::new(""));
+
+    (1..)
+        .map(|counter| parent.join(format!("{} ({}){}", stem, counter, extension)))
+        .find(|candidate| !candidate.exists() && !claimed.contains_key(candidate))
+        .expect("an unused file name exists")
 }
 
 fn move_file(source_path: &Path, target_path: &Path) -> io::Result<()> {
@@ -365,9 +498,15 @@ fn replace_placeholders(
                 return None;
             }
         } else if let Some(album_artist) = &metadata.album_artist {
-            result = result.replace("{artist}", &sanitize_metadata_value(album_artist, config));
+            result = result.replace(
+                "{artist}",
+                &sanitize_metadata_value(primary_artist(album_artist), config),
+            );
         } else if let Some(artist) = &metadata.artist {
-            result = result.replace("{artist}", &sanitize_metadata_value(artist, config));
+            result = result.replace(
+                "{artist}",
+                &sanitize_metadata_value(primary_artist(artist), config),
+            );
         } else {
             return None;
         }
@@ -688,6 +827,31 @@ fn write_normalized_tags(
     Ok(())
 }
 
+fn primary_artist(name: &str) -> &str {
+    let lower = name.to_ascii_lowercase();
+    let end = [
+        ";",
+        " feat.",
+        " feat ",
+        " ft.",
+        " ft ",
+        " featuring ",
+        " (feat",
+        " (ft",
+    ]
+    .iter()
+    .filter_map(|sep| lower.find(sep))
+    .min()
+    .unwrap_or(name.len());
+
+    let primary = name[..end].trim();
+    if primary.is_empty() {
+        name.trim()
+    } else {
+        primary
+    }
+}
+
 fn is_compilation(metadata: &AudioMetadata) -> bool {
     if let Some(album_artist) = &metadata.album_artist {
         album_artist.to_lowercase() == "various artists"
@@ -710,5 +874,23 @@ fn cleanup_empty_dirs(dir: &Path) {
         if is_empty && dir != Path::new("") {
             let _ = fs::remove_dir(dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn primary_artist_cuts_features_but_keeps_acts() {
+        assert_eq!(primary_artist("Travie McCoy Feat. Sia"), "Travie McCoy");
+        assert_eq!(
+            primary_artist("Fish & Chips feat. Lisa & Claire"),
+            "Fish & Chips"
+        );
+        assert_eq!(primary_artist("20 Fingers; Roula"), "20 Fingers");
+        assert_eq!(primary_artist("Earth Wind and Fire"), "Earth Wind and Fire");
+        assert_eq!(primary_artist("Lo & Leduc"), "Lo & Leduc");
+        assert_eq!(primary_artist("Tyler, The Creator"), "Tyler, The Creator");
     }
 }
