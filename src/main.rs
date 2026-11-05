@@ -9,6 +9,7 @@ mod organize;
 mod replaygain;
 mod scan;
 mod tag;
+mod tag_ui;
 mod update;
 
 use crate::config::load_or_create_config;
@@ -51,6 +52,8 @@ enum Commands {
         path: Option<PathBuf>,
         #[arg(short, long)]
         force: bool,
+        #[arg(short, long)]
+        plain: bool,
     },
 
     Update,
@@ -187,7 +190,7 @@ fn run_replaygain(path: Option<PathBuf>, force: bool) {
     }
 }
 
-fn run_tag(path: Option<PathBuf>, force: bool) {
+fn run_tag(path: Option<PathBuf>, force: bool, plain: bool) {
     let path = match resolve_path(path) {
         Ok(path) => path,
         Err(e) => {
@@ -210,7 +213,7 @@ fn run_tag(path: Option<PathBuf>, force: bool) {
     );
     println!("  Target: {}", style(path.display()).green());
 
-    if let Err(e) = tag_music_files(&path, force) {
+    if let Err(e) = tag_music_files(&path, force, plain) {
         error!("failed to tag files: {}", e);
         eprintln!("ERROR: Failed to tag files: {}", e);
         std::process::exit(1);
@@ -244,7 +247,7 @@ fn main() {
     match cli.command {
         Commands::Organize { dir, normalize } => run_organize(dir, cli.verbose, normalize),
         Commands::Replaygain { path, force } => run_replaygain(path, force),
-        Commands::Tag { path, force } => run_tag(path, force),
+        Commands::Tag { path, force, plain } => run_tag(path, force, plain),
         Commands::Update => run_update(),
     }
 
