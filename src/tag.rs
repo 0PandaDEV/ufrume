@@ -227,16 +227,28 @@ fn has_omm_tags(path: &Path) -> bool {
     else {
         return false;
     };
-    read_omm_song_id(tag).is_some_and(|id| valid_id(id.trim(), "song"))
+    read_omm_song_id(tag).is_some_and(|id| {
+        let id = id.trim();
+        valid_id(id, "song") || is_bare_id(id)
+    })
+}
+
+fn is_bare_id(id: &str) -> bool {
+    (1..=18).contains(&id.len()) && !id.starts_with('0') && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn bare_id(id: &str) -> &str {
+    id.rsplit(':').next().unwrap_or(id)
 }
 
 fn omm_ids(candidate: &TagCandidate) -> Vec<(&'static str, String)> {
-    let mut ids = vec![(SONG_ID_KEY, candidate.song_id.clone())];
+    let mut ids = vec![(SONG_ID_KEY, bare_id(&candidate.song_id).to_string())];
     if let Some(ref id) = candidate.album_id {
-        ids.push((ALBUM_ID_KEY, id.clone()));
+        ids.push((ALBUM_ID_KEY, bare_id(id).to_string()));
     }
     if !candidate.artist_ids.is_empty() {
-        ids.push((ARTIST_ID_KEY, candidate.artist_ids.join("; ")));
+        let artists: Vec<&str> = candidate.artist_ids.iter().map(|id| bare_id(id)).collect();
+        ids.push((ARTIST_ID_KEY, artists.join("; ")));
     }
     ids
 }
@@ -346,11 +358,7 @@ fn valid_id(id: &str, kind: &str) -> bool {
     id.strip_prefix("omm:")
         .and_then(|rest| rest.strip_prefix(kind))
         .and_then(|rest| rest.strip_prefix(':'))
-        .is_some_and(|tail| {
-            (1..=18).contains(&tail.len())
-                && !tail.starts_with('0')
-                && tail.bytes().all(|b| b.is_ascii_digit())
-        })
+        .is_some_and(is_bare_id)
 }
 
 fn artist_queries(artist: &str) -> Vec<String> {
