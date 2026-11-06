@@ -244,8 +244,15 @@ fn plan_file(
         Some(key) => (key, false),
         None => (
             MetadataKey {
-                artist: "Unknown".to_string(),
-                album: "Unknown".to_string(),
+                artist: metadata
+                    .album_artist
+                    .clone()
+                    .or_else(|| metadata.artist.clone())
+                    .unwrap_or_else(|| "Unknown".to_string()),
+                album: metadata
+                    .album
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string()),
                 title: source_path
                     .file_stem()
                     .unwrap_or_default()
@@ -461,9 +468,87 @@ fn generate_target_path(
     };
 
     let path_str =
-        replace_placeholders(structure, source_path, metadata, config, multi_disc_albums)?;
+        match replace_placeholders(structure, source_path, metadata, config, multi_disc_albums) {
+            Some(path) => path,
+            None => {
+                let pruned = prune_template(structure, metadata)?;
+                replace_placeholders(&pruned, source_path, metadata, config, multi_disc_albums)?
+            }
+        };
     let sanitized_path = sanitize_path(&path_str, config);
     Some(PathBuf::from(sanitized_path))
+}
+
+fn placeholder_available(name: &str, metadata: &AudioMetadata) -> bool {
+    match name {
+        "artist" => metadata.artist.is_some() || metadata.album_artist.is_some(),
+        "title" => metadata.title.is_some(),
+        "album" => metadata.album.is_some(),
+        "year" => metadata.year.is_some(),
+        "track" => metadata.track.is_some(),
+        "disc" => metadata.disc.is_some(),
+        "genre" => metadata.genre.is_some(),
+        _ => true,
+    }
+}
+
+fn part_placeholders(part: &str) -> Vec<&str> {
+    let mut names = Vec::new();
+    let mut rest = part;
+    while let Some(start) = rest.find('{') {
+        let Some(len) = rest[start..].find('}') else {
+            break;
+        };
+        let inner = &rest[start + 1..start + len];
+        names.push(inner.split(':').next().unwrap_or(inner));
+        rest = &rest[start + len + 1..];
+    }
+    names
+}
+
+fn prune_template(template: &str, metadata: &AudioMetadata) -> Option<String> {
+    let mut used_metadata = false;
+    let mut segments: Vec<String> = Vec::new();
+
+    let all: Vec<&str> = template.split('/').collect();
+    let last_index = all.len() - 1;
+    let mut file_segment = "{filename}".to_string();
+
+    for (index, segment) in all.iter().enumerate() {
+        let kept: Vec<&str> = segment
+            .split(" - ")
+            .filter(|part| {
+                part_placeholders(part)
+                    .iter()
+                    .all(|name| placeholder_available(name, metadata))
+            })
+            .collect();
+        let joined = kept.join(" - ");
+        if joined.is_empty() {
+            continue;
+        }
+        let names = part_placeholders(&joined);
+        if index == last_index {
+            if names.contains(&"title") {
+                used_metadata = true;
+                file_segment = joined;
+            } else if names.contains(&"filename") {
+                file_segment = joined;
+            }
+        } else {
+            if names.iter().any(|name| *name != "filename") {
+                used_metadata = true;
+            }
+            segments.push(joined);
+        }
+    }
+
+    if !used_metadata {
+        return None;
+    }
+
+    segments.push(file_segment);
+    Some(segments.join("/"))
 }
 
 fn generate_fallback_path(source_path: &Path, config: &Config) -> PathBuf {
@@ -892,5 +977,46 @@ mod tests {
         assert_eq!(primary_artist("Earth Wind and Fire"), "Earth Wind and Fire");
         assert_eq!(primary_artist("Lo & Leduc"), "Lo & Leduc");
         assert_eq!(primary_artist("Tyler, The Creator"), "Tyler, The Creator");
+    }
+
+    #[test]
+    fn artist_only_files_go_into_artist_folder() {
+        let config = Config::default();
+        let meta = AudioMetadata {
+            title: None,
+            artist: Some("Pumuckl".to_string()),
+            album: None,
+            album_artist: None,
+            year: None,
+            genre: None,
+            track: None,
+            disc: None,
+        };
+        let path = generate_target_path(
+            Path::new("/m/01-A Pumuckl - En Kobold.mp3"),
+            &meta,
+            &config,
+            &HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(path, PathBuf::from("Pumuckl/01-A Pumuckl - En Kobold.mp3"));
+    }
+
+    #[test]
+    fn no_metadata_still_falls_back() {
+        let config = Config::default();
+        let meta = AudioMetadata {
+            title: None,
+            artist: None,
+            album: None,
+            album_artist: None,
+            year: None,
+            genre: None,
+            track: Some(3),
+            disc: None,
+        };
+        assert!(
+            generate_target_path(Path::new("/m/a.mp3"), &meta, &config, &HashSet::new()).is_none()
+        );
     }
 }
