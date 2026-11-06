@@ -1,5 +1,6 @@
 use crate::scan::{collect_music_paths, is_music_file};
 
+use crate::tag_manual;
 use crate::tag_ui;
 
 use console::{Term, truncate_str};
@@ -13,6 +14,7 @@ use lofty::ogg::tag::VorbisComments;
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::prelude::*;
 use lofty::tag::{ItemKey, Tag, TagType};
+use rayon::prelude::*;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::collections::{HashMap, HashSet};
@@ -40,12 +42,15 @@ const ARTIST_ID_KEY: &str = "OMM_ARTIST_ID";
 const COVER_CACHE: usize = 16;
 const THUMB_CACHE: usize = 64;
 const THUMB_PIXELS: u32 = 160;
+const PREVIEW_PIXELS: &str = "300";
+const SEARCH_LIMIT: u32 = 10;
 
-struct ExistingMeta {
-    title: Option<String>,
-    artist: Option<String>,
-    album: Option<String>,
-    duration_ms: Option<u128>,
+#[derive(Default)]
+pub(crate) struct ExistingMeta {
+    pub(crate) title: Option<String>,
+    pub(crate) artist: Option<String>,
+    pub(crate) album: Option<String>,
+    pub(crate) duration_ms: Option<u128>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,63 +59,116 @@ struct OmmSingle<T> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct OmmList<T> {
-    data: Vec<T>,
+pub(crate) struct OmmList<T> {
+    pub(crate) data: Vec<T>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct OmmSong {
-    id: String,
-    attributes: OmmSongAttributes,
-    relationships: Option<OmmSongRelationships>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct OmmSongAttributes {
-    name: String,
-    album_name: Option<String>,
-    #[serde(default)]
-    artist_names: Vec<String>,
-    isrc: Option<String>,
-    track_number: Option<u32>,
-    disc_number: Option<u32>,
-    genres: Option<Vec<String>>,
-    release_date: Option<String>,
-    artwork_url: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct OmmSongRelationships {
-    albums: Option<OmmList<OmmAlbum>>,
-    artists: Option<OmmList<OmmArtist>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct OmmAlbum {
-    id: String,
-    attributes: OmmAlbumAttributes,
+pub(crate) struct OmmSong {
+    pub(crate) id: String,
+    pub(crate) attributes: OmmSongAttributes,
+    pub(crate) relationships: Option<OmmSongRelationships>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct OmmAlbumAttributes {
-    name: String,
+pub(crate) struct OmmSongAttributes {
+    pub(crate) name: String,
+    pub(crate) album_name: Option<String>,
     #[serde(default)]
-    artist_names: Vec<String>,
-    release_date: Option<String>,
-    artwork_url: Option<String>,
+    pub(crate) artist_names: Vec<String>,
+    pub(crate) isrc: Option<String>,
+    pub(crate) track_number: Option<u32>,
+    pub(crate) disc_number: Option<u32>,
+    pub(crate) genres: Option<Vec<String>>,
+    pub(crate) release_date: Option<String>,
+    pub(crate) artwork_url: Option<String>,
+    pub(crate) duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct OmmArtist {
-    id: String,
-    attributes: OmmArtistAttributes,
+pub(crate) struct OmmSongRelationships {
+    pub(crate) albums: Option<OmmList<OmmAlbum>>,
+    pub(crate) artists: Option<OmmList<OmmArtist>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct OmmArtistAttributes {
-    name: String,
+pub(crate) struct OmmAlbum {
+    pub(crate) id: String,
+    pub(crate) attributes: OmmAlbumAttributes,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OmmAlbumAttributes {
+    pub(crate) name: String,
+    #[serde(default)]
+    pub(crate) artist_names: Vec<String>,
+    pub(crate) release_date: Option<String>,
+    pub(crate) artwork_url: Option<String>,
+    pub(crate) track_count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct OmmArtist {
+    pub(crate) id: String,
+    pub(crate) attributes: OmmArtistAttributes,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OmmArtistAttributes {
+    pub(crate) name: String,
+    pub(crate) artwork_url: Option<String>,
+    pub(crate) genres: Option<Vec<String>>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct SongHint {
+    pub(crate) artist_id: Option<String>,
+    pub(crate) album_id: Option<String>,
+    pub(crate) artist: Option<String>,
+    pub(crate) album: Option<String>,
+    pub(crate) duration_ms: Option<u128>,
+}
+
+pub(crate) struct Probe {
+    pub(crate) variants: Vec<String>,
+    pub(crate) hint: SongHint,
+}
+
+pub(crate) struct Suggestion<T> {
+    pub(crate) item: T,
+    pub(crate) votes: usize,
+    pub(crate) total: usize,
+}
+
+impl<T> Suggestion<T> {
+    fn new(item: T, total: usize) -> Self {
+        Self {
+            item,
+            votes: 0,
+            total,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Discovery {
+    pub(crate) albums: Vec<Suggestion<OmmAlbum>>,
+    pub(crate) artists: Vec<Suggestion<OmmArtist>>,
+}
+
+fn artist_fits(song: &OmmSong, artist: Option<&str>) -> bool {
+    match non_empty(artist) {
+        Some(artist) if !song.attributes.artist_names.is_empty() && !is_generic_artist(artist) => {
+            song.attributes
+                .artist_names
+                .iter()
+                .any(|name| names_match(name, artist) || names_match(artist, name))
+        }
+        _ => true,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -210,14 +268,14 @@ impl Scope<'_> {
     }
 }
 
-struct Resolver {
+pub(crate) struct Resolver {
     client: reqwest::blocking::Client,
     artists: Mutex<HashMap<String, Option<OmmArtist>>>,
     albums: Mutex<HashMap<String, Option<OmmAlbum>>>,
     covers: Mutex<HashMap<String, Option<Arc<Vec<u8>>>>>,
 }
 
-fn has_omm_tags(path: &Path) -> bool {
+pub(crate) fn has_omm_tags(path: &Path) -> bool {
     let Ok(tagged_file) = lofty::read_from_path(path) else {
         return false;
     };
@@ -242,7 +300,10 @@ fn bare_id(id: &str) -> &str {
 }
 
 fn omm_ids(candidate: &TagCandidate) -> Vec<(&'static str, String)> {
-    let mut ids = vec![(SONG_ID_KEY, bare_id(&candidate.song_id).to_string())];
+    let mut ids = Vec::new();
+    if !candidate.song_id.is_empty() {
+        ids.push((SONG_ID_KEY, bare_id(&candidate.song_id).to_string()));
+    }
     if let Some(ref id) = candidate.album_id {
         ids.push((ALBUM_ID_KEY, bare_id(id).to_string()));
     }
@@ -323,7 +384,7 @@ fn save_with_ids(
     Ok(())
 }
 
-fn read_existing_metadata(path: &Path) -> Option<ExistingMeta> {
+pub(crate) fn read_existing_metadata(path: &Path) -> Option<ExistingMeta> {
     let tagged_file = lofty::read_from_path(path).ok()?;
     let duration_ms = Some(tagged_file.properties().duration().as_millis()).filter(|d| *d > 0);
     let tag = tagged_file
@@ -454,7 +515,7 @@ fn fold_tokens(text: &str) -> HashSet<String> {
         .collect()
 }
 
-fn names_match(a: &str, b: &str) -> bool {
+pub(crate) fn names_match(a: &str, b: &str) -> bool {
     let (fa, fb) = (fold(a), fold(b));
     if fa.is_empty() || fb.is_empty() {
         return false;
@@ -589,9 +650,11 @@ fn thumbnail(bytes: &[u8]) -> ApiResult<DynamicImage> {
 }
 
 fn sized_cover_url(url: &str) -> String {
-    let url = url
-        .replace("{w}", COVER_PIXELS)
-        .replace("{h}", COVER_PIXELS);
+    sized_cover_url_px(url, COVER_PIXELS)
+}
+
+fn sized_cover_url_px(url: &str, px: &str) -> String {
+    let url = url.replace("{w}", px).replace("{h}", px);
     let Some((base, name)) = url.rsplit_once('/') else {
         return url;
     };
@@ -603,7 +666,7 @@ fn sized_cover_url(url: &str) -> String {
         (digits(w) && digits(&rest[..end])).then(|| &rest[end..])
     });
     match sized {
-        Some(suffix) => format!("{base}/{COVER_PIXELS}x{COVER_PIXELS}{suffix}"),
+        Some(suffix) => format!("{base}/{px}x{px}{suffix}"),
         None => url,
     }
 }
@@ -675,7 +738,7 @@ fn report_for(existing: &ExistingMeta, candidate: TagCandidate) -> Report {
 }
 
 impl Resolver {
-    fn new(client: reqwest::blocking::Client) -> Self {
+    pub(crate) fn new(client: reqwest::blocking::Client) -> Self {
         Self {
             client,
             artists: Mutex::new(HashMap::new()),
@@ -684,7 +747,7 @@ impl Resolver {
         }
     }
 
-    fn cover_bytes(&self, url: &str) -> Option<Arc<Vec<u8>>> {
+    pub(crate) fn cover_bytes(&self, url: &str) -> Option<Arc<Vec<u8>>> {
         if let Some(cached) = self.covers.lock().unwrap().get(url) {
             return cached.clone();
         }
@@ -705,6 +768,165 @@ impl Resolver {
         }
         covers.insert(url.to_string(), bytes.clone());
         bytes
+    }
+
+    pub(crate) fn preview(&self, url: &str) -> Option<DynamicImage> {
+        let bytes = self
+            .client
+            .get(sized_cover_url_px(url, PREVIEW_PIXELS))
+            .send()
+            .and_then(|r| r.error_for_status())
+            .and_then(|r| r.bytes())
+            .map_err(|e| debug!("preview download failed: {}", e))
+            .ok()?;
+        thumbnail(&bytes).ok()
+    }
+
+    fn search<T: DeserializeOwned>(&self, path: &str, mut query: Query) -> ApiResult<Vec<T>> {
+        query.push(("limit", SEARCH_LIMIT.to_string()));
+        Ok(get_json::<OmmList<T>>(&self.client, path, &query)?
+            .map(|r| r.data)
+            .unwrap_or_default())
+    }
+
+    pub(crate) fn search_artists(&self, name: &str) -> ApiResult<Vec<OmmArtist>> {
+        self.search("/search/artist", vec![("name", truncate_param(name))])
+    }
+
+    pub(crate) fn search_albums(
+        &self,
+        name: &str,
+        artist_id: Option<&str>,
+    ) -> ApiResult<Vec<OmmAlbum>> {
+        let mut query: Query = vec![("name", truncate_param(name))];
+        if let Some(id) = artist_id.filter(|id| valid_id(id, "artist")) {
+            query.push(("artist_id", id.to_string()));
+        }
+        self.search("/search/album", query)
+    }
+
+    pub(crate) fn search_songs(&self, name: &str, hint: &SongHint) -> ApiResult<Vec<OmmSong>> {
+        let mut query: Query = vec![("name", truncate_param(name))];
+        let album_id = hint.album_id.as_deref().filter(|id| valid_id(id, "album"));
+        let artist_id = hint
+            .artist_id
+            .as_deref()
+            .filter(|id| valid_id(id, "artist"));
+        match (album_id, artist_id) {
+            (Some(id), _) => query.push(("album_id", id.to_string())),
+            (None, Some(id)) => query.push(("artist_id", id.to_string())),
+            _ => {}
+        }
+        if artist_id.is_none()
+            && let Some(artist) =
+                non_empty(hint.artist.as_deref()).filter(|a| !is_generic_artist(a))
+        {
+            query.push(("artist", truncate_param(artist)));
+        }
+        if album_id.is_none()
+            && let Some(album) = non_empty(hint.album.as_deref())
+        {
+            query.push(("album", truncate_param(album)));
+        }
+        if let Some(duration) = hint.duration_ms {
+            query.push(("duration", duration.to_string()));
+        }
+        self.search("/search/song", query)
+    }
+
+    fn rank_songs(&self, variants: &[String], hint: &SongHint) -> ApiResult<Vec<OmmSong>> {
+        let mut failure = None;
+        for variant in variants {
+            match self.search_songs(variant, hint) {
+                Ok(songs) => {
+                    let mut hits: Vec<OmmSong> = songs
+                        .into_iter()
+                        .filter(|song| names_match(&song.attributes.name, variant))
+                        .filter(|song| artist_fits(song, hint.artist.as_deref()))
+                        .collect();
+                    if let Some(local) = hint.duration_ms {
+                        hits.sort_by_key(|song| {
+                            song.attributes
+                                .duration_ms
+                                .map_or(u128::MAX, |ms| u128::from(ms).abs_diff(local))
+                        });
+                    }
+                    if !hits.is_empty() {
+                        return Ok(hits);
+                    }
+                }
+                Err(e) => failure = Some(e),
+            }
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub(crate) fn match_song(
+        &self,
+        variants: &[String],
+        hint: &SongHint,
+    ) -> ApiResult<Option<OmmSong>> {
+        Ok(self.rank_songs(variants, hint)?.into_iter().next())
+    }
+
+    pub(crate) fn discover(&self, probes: &[Probe]) -> Discovery {
+        let hits: Vec<Vec<OmmSong>> = probes
+            .par_iter()
+            .map(|probe| {
+                self.rank_songs(&probe.variants, &probe.hint)
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        let mut albums: HashMap<String, Suggestion<OmmAlbum>> = HashMap::new();
+        let mut artists: HashMap<String, Suggestion<OmmArtist>> = HashMap::new();
+        for songs in &hits {
+            let mut seen_albums = HashSet::new();
+            let mut seen_artists = HashSet::new();
+            for song in songs.iter().take(5) {
+                let Some(relationships) = song.relationships.as_ref() else {
+                    continue;
+                };
+                for album in relationships.albums.iter().flat_map(|l| l.data.iter()) {
+                    if seen_albums.insert(album.id.clone()) {
+                        albums
+                            .entry(album.id.clone())
+                            .or_insert_with(|| Suggestion::new(album.clone(), probes.len()))
+                            .votes += 1;
+                    }
+                }
+                for artist in relationships.artists.iter().flat_map(|l| l.data.iter()) {
+                    if seen_artists.insert(artist.id.clone()) {
+                        artists
+                            .entry(artist.id.clone())
+                            .or_insert_with(|| Suggestion::new(artist.clone(), probes.len()))
+                            .votes += 1;
+                    }
+                }
+            }
+        }
+
+        fn ranked<T>(
+            map: HashMap<String, Suggestion<T>>,
+            name: impl Fn(&T) -> &str,
+        ) -> Vec<Suggestion<T>> {
+            let mut list: Vec<Suggestion<T>> = map.into_values().collect();
+            list.sort_by(|a, b| {
+                b.votes
+                    .cmp(&a.votes)
+                    .then_with(|| name(&a.item).cmp(name(&b.item)))
+            });
+            list.truncate(SEARCH_LIMIT as usize);
+            list
+        }
+
+        Discovery {
+            albums: ranked(albums, |a| a.attributes.name.as_str()),
+            artists: ranked(artists, |a| a.attributes.name.as_str()),
+        }
     }
 
     fn resolve_artist(&self, artist: &str) -> ApiResult<Option<OmmArtist>> {
@@ -1069,6 +1291,7 @@ pub fn tag_music_files(
     path: &Path,
     force: bool,
     plain: bool,
+    manual: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let files: Vec<PathBuf> = if path.is_file() {
         if !is_music_file(path) {
@@ -1102,6 +1325,20 @@ pub fn tag_music_files(
         ))
         .timeout(Duration::from_secs(30))
         .build()?;
+
+    if manual {
+        if !std::io::stdout().is_terminal() {
+            return Err("manual tagging needs an interactive terminal".into());
+        }
+        let counts = tag_manual::run(sorted_files, force, Arc::new(Resolver::new(client)))?;
+        println!(
+            "  {} files tagged, {} left untouched, {} failed",
+            console::style(counts.tagged).green(),
+            console::style(counts.skipped).dim(),
+            console::style(counts.failed).red()
+        );
+        return Ok(());
+    }
 
     let root = if path.is_file() {
         path.parent().unwrap_or(path).to_path_buf()
@@ -1209,6 +1446,17 @@ fn process_file(
     }
     candidate.album_artists.truncate(1);
 
+    let report = apply_candidate(path, candidate, &existing, force, resolver)?;
+    Ok(Outcome::Tagged(Box::new(report)))
+}
+
+pub(crate) fn apply_candidate(
+    path: &Path,
+    candidate: TagCandidate,
+    existing: &ExistingMeta,
+    force: bool,
+    resolver: &Resolver,
+) -> Result<Report, Box<dyn std::error::Error>> {
     let had_cover = has_front_cover(path);
     let cover = match candidate.artwork.as_deref() {
         Some(url) if force || !had_cover => resolver.cover_bytes(url),
@@ -1217,7 +1465,7 @@ fn process_file(
 
     let embedded = write_metadata_tags(path, &candidate, cover.as_deref().map(Vec::as_slice))?;
 
-    let mut report = report_for(&existing, candidate);
+    let mut report = report_for(existing, candidate);
     if embedded {
         if had_cover {
             report.changed.push("cover");
@@ -1225,7 +1473,77 @@ fn process_file(
             report.wrote.push("cover");
         }
     }
-    Ok(Outcome::Tagged(Box::new(report)))
+    Ok(report)
+}
+
+pub(crate) fn manual_candidate(
+    song: OmmSong,
+    artist: Option<&OmmArtist>,
+    album: Option<&OmmAlbum>,
+    existing: &ExistingMeta,
+) -> TagCandidate {
+    let artist_id = artist
+        .map(|a| a.id.as_str())
+        .filter(|id| valid_id(id, "artist"));
+    let album_id = album
+        .map(|a| a.id.as_str())
+        .filter(|id| valid_id(id, "album"));
+    let mut candidate = song_to_candidate(song, album_id, artist_id, existing.album.as_deref());
+
+    if let Some(artist) = artist {
+        prioritize_artist(&mut candidate.artists, &artist.attributes.name);
+        prioritize_artist(&mut candidate.album_artists, &artist.attributes.name);
+    }
+    dedup_names(&mut candidate.artists);
+    dedup_names(&mut candidate.album_artists);
+    if candidate.album_artists.is_empty() {
+        candidate.album_artists = candidate.artists.first().cloned().into_iter().collect();
+    }
+    candidate.album_artists.truncate(1);
+    candidate
+}
+
+pub(crate) fn partial_candidate(
+    title: &str,
+    artist: Option<&OmmArtist>,
+    album: Option<&OmmAlbum>,
+    existing: &ExistingMeta,
+) -> TagCandidate {
+    let mut artists: Vec<String> = match artist {
+        Some(artist) => vec![artist.attributes.name.clone()],
+        None => existing.artist.iter().cloned().collect(),
+    };
+    dedup_names(&mut artists);
+
+    let mut album_artists = match artist {
+        Some(artist) => vec![artist.attributes.name.clone()],
+        None => album
+            .map(|a| a.attributes.artist_names.clone())
+            .unwrap_or_default(),
+    };
+    dedup_names(&mut album_artists);
+    album_artists.truncate(1);
+
+    TagCandidate {
+        title: title.to_string(),
+        artists,
+        album: album.map(|a| a.attributes.name.clone()),
+        album_artists,
+        date: album.and_then(|a| a.attributes.release_date.clone()),
+        track: None,
+        disc: None,
+        genre: None,
+        isrc: None,
+        artwork: album.and_then(|a| a.attributes.artwork_url.clone()),
+        song_id: String::new(),
+        album_id: album.map(|a| a.id.clone()),
+        artist_ids: artist.map(|a| a.id.clone()).into_iter().collect(),
+    }
+}
+
+pub(crate) fn dedup_names(names: &mut Vec<String>) {
+    let mut seen = HashSet::new();
+    names.retain(|name| seen.insert(fold(name)));
 }
 
 #[cfg(test)]
@@ -1243,6 +1561,22 @@ mod tests {
         ));
         assert!(!names_match("Daft Punk", "Queen"));
         assert!(!names_match("Li", "Lisa"));
+    }
+
+    #[test]
+    fn partial_candidates_carry_no_song_id() {
+        let artist = OmmArtist {
+            id: "omm:artist:7".to_string(),
+            attributes: OmmArtistAttributes {
+                name: "Daft Punk".to_string(),
+                artwork_url: None,
+                genres: None,
+            },
+        };
+        let candidate =
+            partial_candidate("Aerodynamic", Some(&artist), None, &ExistingMeta::default());
+        assert_eq!(candidate.artists, ["Daft Punk"]);
+        assert_eq!(omm_ids(&candidate), [(ARTIST_ID_KEY, "7".to_string())]);
     }
 
     #[test]

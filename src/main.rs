@@ -9,6 +9,7 @@ mod organize;
 mod replaygain;
 mod scan;
 mod tag;
+mod tag_manual;
 mod tag_ui;
 mod update;
 
@@ -54,6 +55,8 @@ enum Commands {
         force: bool,
         #[arg(short, long)]
         plain: bool,
+        #[arg(short, long)]
+        manual: bool,
     },
 
     Update,
@@ -190,7 +193,7 @@ fn run_replaygain(path: Option<PathBuf>, force: bool) {
     }
 }
 
-fn run_tag(path: Option<PathBuf>, force: bool, plain: bool) {
+fn run_tag(path: Option<PathBuf>, force: bool, plain: bool, manual: bool) {
     let path = match resolve_path(path) {
         Ok(path) => path,
         Err(e) => {
@@ -213,7 +216,7 @@ fn run_tag(path: Option<PathBuf>, force: bool, plain: bool) {
     );
     println!("  Target: {}", style(path.display()).green());
 
-    if let Err(e) = tag_music_files(&path, force, plain) {
+    if let Err(e) = tag_music_files(&path, force, plain, manual) {
         error!("failed to tag files: {}", e);
         eprintln!("ERROR: Failed to tag files: {}", e);
         std::process::exit(1);
@@ -247,7 +250,12 @@ fn main() {
     match cli.command {
         Commands::Organize { dir, normalize } => run_organize(dir, cli.verbose, normalize),
         Commands::Replaygain { path, force } => run_replaygain(path, force),
-        Commands::Tag { path, force, plain } => run_tag(path, force, plain),
+        Commands::Tag {
+            path,
+            force,
+            plain,
+            manual,
+        } => run_tag(path, force, plain, manual),
         Commands::Update => run_update(),
     }
 

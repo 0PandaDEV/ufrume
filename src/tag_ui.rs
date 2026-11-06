@@ -29,21 +29,21 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 use terminal_colorsaurus::{QueryOptions, background_color};
 
-const ACCENT: Color = Color::Rgb(255, 135, 31);
-const GREEN: Color = Color::Rgb(126, 200, 120);
-const RED: Color = Color::Rgb(235, 100, 100);
-const FG: Color = Color::Rgb(216, 216, 216);
-const FG_DIM: Color = Color::Rgb(138, 138, 138);
-const FG_FAINT: Color = Color::Rgb(86, 86, 86);
+pub(crate) const ACCENT: Color = Color::Rgb(255, 135, 31);
+pub(crate) const GREEN: Color = Color::Rgb(126, 200, 120);
+pub(crate) const RED: Color = Color::Rgb(235, 100, 100);
+pub(crate) const FG: Color = Color::Rgb(216, 216, 216);
+pub(crate) const FG_DIM: Color = Color::Rgb(138, 138, 138);
+pub(crate) const FG_FAINT: Color = Color::Rgb(86, 86, 86);
 
 const LOG_CAPACITY: usize = 500;
 const EVENTS_PER_FRAME: usize = 256;
-const FRAME: Duration = Duration::from_millis(50);
+pub(crate) const FRAME: Duration = Duration::from_millis(50);
 const MAX_COVER_ROWS: u16 = 10;
 const MIN_COVER_ROWS: u16 = 4;
 const LABEL_WIDTH: usize = 10;
 
-type Term = Terminal<CrosstermBackend<io::Stdout>>;
+pub(crate) type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
 enum Kind {
     Tagged,
@@ -77,7 +77,7 @@ struct App {
     background: Option<(u8, u8, u8)>,
 }
 
-struct Restore;
+pub(crate) struct Restore;
 
 impl Drop for Restore {
     fn drop(&mut self) {
@@ -86,25 +86,25 @@ impl Drop for Restore {
     }
 }
 
-fn blend(bg: (u8, u8, u8), alpha: i32) -> Color {
+pub(crate) fn blend(bg: (u8, u8, u8), alpha: i32) -> Color {
     let luma = (bg.0 as i32 * 299 + bg.1 as i32 * 587 + bg.2 as i32 * 114) / 1000;
     let target = if luma < 128 { 255 } else { 0 };
     let mix = |c: u8| (c as i32 + (target - c as i32) * alpha / 100) as u8;
     Color::Rgb(mix(bg.0), mix(bg.1), mix(bg.2))
 }
 
-fn sp(text: impl Into<String>, color: Color) -> Span<'static> {
+pub(crate) fn sp(text: impl Into<String>, color: Color) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(color))
 }
 
-fn bold(text: impl Into<String>, color: Color) -> Span<'static> {
+pub(crate) fn bold(text: impl Into<String>, color: Color) -> Span<'static> {
     Span::styled(
         text.into(),
         Style::default().fg(color).add_modifier(Modifier::BOLD),
     )
 }
 
-fn clip(text: &str, width: usize) -> String {
+pub(crate) fn clip(text: &str, width: usize) -> String {
     truncate_str(text, width.max(1), "…").into_owned()
 }
 
@@ -228,11 +228,11 @@ impl App {
     }
 }
 
-fn fill(f: &mut Frame, area: Rect, bg: Color) {
+pub(crate) fn fill(f: &mut Frame, area: Rect, bg: Color) {
     f.render_widget(Block::default().style(Style::default().bg(bg)), area);
 }
 
-fn detect_background() -> Option<(u8, u8, u8)> {
+pub(crate) fn detect_background() -> Option<(u8, u8, u8)> {
     let mut options = QueryOptions::default();
     options.timeout = Duration::from_millis(300);
     background_color(options).ok().map(|c| c.scale_to_8bit())
