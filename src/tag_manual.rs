@@ -29,6 +29,7 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -44,6 +45,7 @@ const DISCOVERY_SAMPLE: usize = 12;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Stage {
+    Files,
     Artist,
     Album,
     Songs,
@@ -64,15 +66,15 @@ struct Slot {
     variants: Vec<String>,
     song: Option<OmmSong>,
     state: MatchState,
+    skipped: bool,
+    marked: bool,
 }
 
 struct Group {
     rel: String,
-    has_artist: bool,
-    has_album: bool,
+    artist_dir: String,
+    album_dir: String,
     slots: Vec<Slot>,
-    artist_query: String,
-    album_query: String,
 }
 
 struct Input {
@@ -386,7 +388,20 @@ fn spawn_workers(resolver: Arc<Resolver>) -> (Sender<Req>, Receiver<Resp>) {
     (req_tx, resp_rx)
 }
 
+struct Player {
+    child: Child,
+    path: PathBuf,
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 struct App {
+    player: Option<Player>,
     groups: Vec<Group>,
     gi: usize,
     stage: Stage,
@@ -399,6 +414,11 @@ struct App {
     discovery: Option<Discovery>,
     discovering: bool,
     group_seq: u64,
+    pool: Vec<Slot>,
+    file_cursor: usize,
+    file_offset: usize,
+    has_artist: bool,
+    has_album: bool,
     slots: Vec<Slot>,
     cursor: usize,
     offset: usize,
@@ -425,6 +445,27 @@ fn mode<'a>(values: impl Iterator<Item = Option<&'a str>>) -> Option<String> {
         .into_iter()
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
         .map(|(value, _)| value.to_string())
+}
+
+fn dominant_share<'a>(values: impl Iterator<Item = Option<&'a str>>) -> Option<(usize, f64)> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for value in values.flatten().map(str::trim).filter(|v| !v.is_empty()) {
+        *counts.entry(value).or_default() += 1;
+    }
+    let total: usize = counts.values().sum();
+    let top = counts.values().copied().max()?;
+    Some((counts.len(), top as f64 / total as f64))
+}
+
+fn is_mixed(slots: &[Slot]) -> bool {
+    if slots.len() < 3 {
+        return false;
+    }
+    let artist_mixed = dominant_share(slots.iter().map(|s| s.existing.artist.as_deref()))
+        .is_some_and(|(distinct, share)| distinct >= 2 && share < 0.6);
+    let album_single = dominant_share(slots.iter().map(|s| s.existing.album.as_deref()))
+        .is_some_and(|(_, share)| share >= 0.6);
+    artist_mixed && !album_single
 }
 
 fn dir_name(path: Option<&Path>) -> String {
@@ -459,6 +500,8 @@ fn build_groups(files: Vec<PathBuf>, force: bool) -> Vec<Group> {
                     variants,
                     song: None,
                     state: MatchState::Idle,
+                    skipped: false,
+                    marked: true,
                 },
             )
         })
@@ -475,23 +518,16 @@ fn build_groups(files: Vec<PathBuf>, force: bool) -> Vec<Group> {
             slots.sort_by(|a, b| a.path.cmp(&b.path));
             let album_dir = dir_name(Some(&dir));
             let artist_dir = dir_name(dir.parent());
-            let artist_tag = mode(slots.iter().map(|s| s.existing.artist.as_deref()));
-            let album_tag = mode(slots.iter().map(|s| s.existing.album.as_deref()));
-            let (has_artist, has_album) = (artist_tag.is_some(), album_tag.is_some());
-            let artist_query = artist_tag.unwrap_or(artist_dir.clone());
-            let album_query = album_tag.unwrap_or(album_dir.clone());
             let rel = if artist_dir.is_empty() {
-                album_dir
+                album_dir.clone()
             } else {
                 format!("{}/{}", artist_dir, album_dir)
             };
             Group {
                 rel,
-                has_artist,
-                has_album,
+                artist_dir,
+                album_dir,
                 slots,
-                artist_query,
-                album_query,
             }
         })
         .collect()
@@ -567,9 +603,10 @@ impl App {
         background: Option<(u8, u8, u8)>,
     ) -> Self {
         let mut app = Self {
+            player: None,
             groups,
             gi: 0,
-            stage: Stage::Artist,
+            stage: Stage::Files,
             artist: Pane::new(""),
             album: Pane::new(""),
             chosen_artist: None,
@@ -579,6 +616,11 @@ impl App {
             discovery: None,
             discovering: false,
             group_seq: 0,
+            pool: Vec::new(),
+            file_cursor: 0,
+            file_offset: 0,
+            has_artist: false,
+            has_album: false,
             slots: Vec::new(),
             cursor: 0,
             offset: 0,
@@ -609,12 +651,56 @@ impl App {
     }
 
     fn load_group(&mut self) {
-        let group = &mut self.groups[self.gi];
-        self.slots = std::mem::take(&mut group.slots);
-        self.artist = Pane::new(&group.artist_query);
-        self.album = Pane::new(&group.album_query);
-        let has_artist = group.has_artist;
-        let group_artist = has_artist.then(|| group.artist_query.clone());
+        self.pool = std::mem::take(&mut self.groups[self.gi].slots);
+        self.mark_first();
+        self.reset_batch();
+    }
+
+    fn reset_batch(&mut self) {
+        self.slots = Vec::new();
+        self.artist = Pane::new("");
+        self.album = Pane::new("");
+        self.chosen_artist = None;
+        self.chosen_album = None;
+        self.album_scope = None;
+        self.matched_for = None;
+        self.cursor = 0;
+        self.offset = 0;
+        self.file_cursor = 0;
+        self.file_offset = 0;
+        self.pick = None;
+        self.gen_id += 1;
+        self.stage = Stage::Files;
+        self.discovery = None;
+        self.discovering = false;
+        self.group_seq += 1;
+    }
+
+    fn begin_batch(&mut self) {
+        if !self.pool.iter().any(|s| s.marked) {
+            self.status = Some(("mark at least one file".to_string(), false));
+            return;
+        }
+        let (taken, rest): (Vec<Slot>, Vec<Slot>) = std::mem::take(&mut self.pool)
+            .into_iter()
+            .partition(|s| s.marked);
+        self.pool = rest;
+        self.slots = taken;
+
+        let artist_tag = mode(self.slots.iter().map(|s| s.existing.artist.as_deref()));
+        let album_tag = mode(self.slots.iter().map(|s| s.existing.album.as_deref()));
+        self.has_artist = artist_tag.is_some();
+        self.has_album = album_tag.is_some();
+        let (artist_query, album_query) = {
+            let group = &self.groups[self.gi];
+            (
+                artist_tag.clone().unwrap_or(group.artist_dir.clone()),
+                album_tag.unwrap_or(group.album_dir.clone()),
+            )
+        };
+
+        self.artist = Pane::new(&artist_query);
+        self.album = Pane::new(&album_query);
         self.chosen_artist = None;
         self.chosen_album = None;
         self.album_scope = None;
@@ -636,7 +722,7 @@ impl App {
             .map(|slot| Probe {
                 variants: slot.variants.clone(),
                 hint: SongHint {
-                    artist: slot.existing.artist.clone().or(group_artist.clone()),
+                    artist: slot.existing.artist.clone().or(artist_tag.clone()),
                     album: slot.existing.album.clone(),
                     duration_ms: slot.existing.duration_ms,
                     ..SongHint::default()
@@ -648,11 +734,114 @@ impl App {
             probes,
         });
 
-        if has_artist {
+        if is_mixed(&self.slots) {
+            self.enter_songs();
+        } else if self.has_artist {
             self.search_artists();
         } else {
             self.artist.loading = true;
             self.artist.queried = Some(self.artist.query());
+        }
+    }
+
+    fn release_batch(&mut self) {
+        let mut slots = std::mem::take(&mut self.slots);
+        for slot in &mut slots {
+            slot.song = None;
+            slot.state = MatchState::Idle;
+            slot.skipped = false;
+            slot.marked = true;
+        }
+        self.pool.extend(slots);
+        self.pool.sort_by(|a, b| a.path.cmp(&b.path));
+        self.reset_batch();
+    }
+
+    fn finish_batch(&mut self) {
+        self.slots.clear();
+        if self.pool.is_empty() {
+            self.next_group();
+            return;
+        }
+        self.mark_first();
+        self.reset_batch();
+    }
+
+    fn mark_first(&mut self) {
+        for (index, slot) in self.pool.iter_mut().enumerate() {
+            slot.marked = index == 0;
+        }
+    }
+
+    fn focused_file(&self) -> Option<(PathBuf, String)> {
+        let slot = match self.stage {
+            Stage::Files => self.pool.get(self.file_cursor),
+            Stage::Songs => self
+                .slots
+                .get(self.pick.as_ref().map_or(self.cursor, |p| p.slot)),
+            _ => self.slots.first(),
+        }?;
+        Some((slot.path.clone(), slot.name.clone()))
+    }
+
+    fn toggle_play(&mut self) {
+        let Some((path, name)) = self.focused_file() else {
+            return;
+        };
+        if self.player.as_ref().is_some_and(|p| p.path == path) {
+            self.player = None;
+            self.status = Some((format!("stopped {}", name), false));
+            return;
+        }
+        self.player = None;
+        let spawned = Command::new("mpv")
+            .args(["--force-window=yes", "--really-quiet", "--no-terminal", "--"])
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        self.status = Some(match spawned {
+            Ok(child) => {
+                self.player = Some(Player { child, path });
+                (format!("playing {}", name), true)
+            }
+            Err(e) => (format!("mpv: {}", e), false),
+        });
+    }
+
+    fn skip_rest(&mut self) {
+        self.counts.skipped += self.pool.len();
+        self.status = Some((
+            format!("skipped rest of {}", self.groups[self.gi].rel),
+            false,
+        ));
+        self.pool.clear();
+        self.next_group();
+    }
+
+    fn on_files_key(&mut self, key: KeyEvent) {
+        let last = self.pool.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Up => self.file_cursor = self.file_cursor.saturating_sub(1),
+            KeyCode::Down => self.file_cursor = (self.file_cursor + 1).min(last),
+            KeyCode::PageUp => self.file_cursor = self.file_cursor.saturating_sub(10),
+            KeyCode::PageDown => self.file_cursor = (self.file_cursor + 10).min(last),
+            KeyCode::Home => self.file_cursor = 0,
+            KeyCode::End => self.file_cursor = last,
+            KeyCode::Char(' ') => {
+                if let Some(slot) = self.pool.get_mut(self.file_cursor) {
+                    slot.marked = !slot.marked;
+                }
+                self.file_cursor = (self.file_cursor + 1).min(last);
+            }
+            KeyCode::Char('a') => self.pool.iter_mut().for_each(|s| s.marked = true),
+            KeyCode::Char('n') => self.pool.iter_mut().for_each(|s| s.marked = false),
+            KeyCode::Char('i') => self.pool.iter_mut().for_each(|s| s.marked = !s.marked),
+            KeyCode::Enter => self.begin_batch(),
+            KeyCode::Char('s') => self.skip_rest(),
+            KeyCode::Char('p') => self.toggle_play(),
+            _ => {}
         }
     }
 
@@ -787,7 +976,7 @@ impl App {
             return;
         }
 
-        if !self.groups[self.gi].has_album && self.album.edited.is_none() {
+        if !self.has_album && self.album.edited.is_none() {
             if self.discovering {
                 self.album.loading = true;
                 self.album.queried = Some(self.album.query());
@@ -830,7 +1019,7 @@ impl App {
             .as_ref()
             .map(|a| a.attributes.name.clone());
         for (index, slot) in self.slots.iter_mut().enumerate() {
-            if slot.song.is_some() {
+            if slot.song.is_some() || slot.skipped {
                 continue;
             }
             slot.state = MatchState::Pending;
@@ -885,7 +1074,8 @@ impl App {
 
     fn back(&mut self) {
         match self.stage {
-            Stage::Artist => {}
+            Stage::Files => {}
+            Stage::Artist => self.release_batch(),
             Stage::Album => self.stage = Stage::Artist,
             Stage::Songs => {
                 self.pick = None;
@@ -930,14 +1120,28 @@ impl App {
         if let Some(slot) = self.slots.get_mut(index) {
             slot.song = song;
             slot.state = MatchState::Done;
+            slot.skipped = false;
+        }
+        self.goto(index + 1);
+    }
+
+    fn skip_file(&mut self) {
+        let Some(pick) = self.pick.as_ref() else {
+            return;
+        };
+        let index = pick.slot;
+        if let Some(slot) = self.slots.get_mut(index) {
+            slot.song = None;
+            slot.state = MatchState::Done;
+            slot.skipped = true;
         }
         self.goto(index + 1);
     }
 
     fn skip_folder(&mut self) {
         self.counts.skipped += self.slots.len();
-        self.status = Some((format!("skipped {}", self.groups[self.gi].rel), false));
-        self.next_group();
+        self.status = Some((format!("skipped {} files", self.slots.len()), false));
+        self.finish_batch();
     }
 
     fn chosen_any(&self) -> bool {
@@ -945,14 +1149,17 @@ impl App {
     }
 
     fn writable(&self) -> usize {
-        if self.chosen_any() {
-            self.slots.len()
-        } else {
-            self.slots.iter().filter(|s| s.song.is_some()).count()
-        }
+        let chosen_any = self.chosen_any();
+        self.slots
+            .iter()
+            .filter(|s| !s.skipped && (chosen_any || s.song.is_some()))
+            .count()
     }
 
     fn save(&mut self) {
+        if self.stage == Stage::Files {
+            return;
+        }
         if self.writable() == 0 {
             self.status = Some(("pick an artist or album first".to_string(), false));
             return;
@@ -965,6 +1172,10 @@ impl App {
         let mut first_error = None;
         let chosen_any = self.chosen_any();
         for slot in &self.slots {
+            if slot.skipped {
+                left += 1;
+                continue;
+            }
             let candidate = match slot.song.clone() {
                 Some(song) => manual_candidate(
                     song,
@@ -1012,7 +1223,7 @@ impl App {
             ),
             None => (format!("wrote {} files", tagged), true),
         });
-        self.next_group();
+        self.finish_batch();
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -1024,12 +1235,24 @@ impl App {
             self.save();
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('f')
+            && matches!(self.stage, Stage::Artist | Stage::Album)
+        {
+            self.enter_songs();
+            return;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+            self.toggle_play();
+            return;
+        }
         if key.code == KeyCode::BackTab {
             self.back();
             return;
         }
 
         match self.stage {
+            Stage::Files => self.on_files_key(key),
             Stage::Artist => match key.code {
                 KeyCode::Tab => self.forward_artist(),
                 _ => match pane_key(&mut self.artist, &key) {
@@ -1056,6 +1279,11 @@ impl App {
             KeyCode::Esc => self.back(),
             KeyCode::PageUp => self.goto(self.cursor.saturating_sub(1)),
             KeyCode::PageDown => self.goto(self.cursor + 1),
+            KeyCode::Char('x')
+                if self.pick.is_some() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.skip_file()
+            }
             _ if self.pick.is_some() => {
                 if key.code == KeyCode::Tab {
                     if let Some(pick) = self.pick.as_mut() {
@@ -1073,6 +1301,7 @@ impl App {
                     PaneAction::None => {}
                 }
             }
+            KeyCode::Char('p') => self.toggle_play(),
             KeyCode::Up => self.goto(self.cursor.saturating_sub(1)),
             KeyCode::Down => self.goto(self.cursor + 1),
             KeyCode::Enter => {
@@ -1116,6 +1345,7 @@ impl App {
                     slot.state = MatchState::Done;
                     if let Ok(Some(song)) = result
                         && slot.song.is_none()
+                        && !slot.skipped
                     {
                         slot.song = Some(*song);
                     }
@@ -1127,10 +1357,7 @@ impl App {
             } if group_seq == self.group_seq => {
                 self.discovering = false;
                 self.discovery = Some(discovery);
-                let (has_artist, has_album) = {
-                    let group = &self.groups[self.gi];
-                    (group.has_artist, group.has_album)
-                };
+                let (has_artist, has_album) = (self.has_artist, self.has_album);
                 if !has_artist && self.artist.edited.is_none() && self.artist.results.is_empty() {
                     self.artist.loading = false;
                     if !self.suggest_artists() {
@@ -1160,6 +1387,11 @@ impl App {
     }
 
     fn tick(&mut self) {
+        if let Some(player) = self.player.as_mut()
+            && matches!(player.child.try_wait(), Ok(Some(_)))
+        {
+            self.player = None;
+        }
         if let Some(pick) = self.pick.as_ref() {
             if pick.pane.due() {
                 self.search_pick();
@@ -1195,6 +1427,7 @@ impl App {
 
     fn focused_artwork(&self) -> Option<String> {
         match self.stage {
+            Stage::Files => None,
             Stage::Artist => self.artist.current()?.attributes.artwork_url.clone(),
             Stage::Album => self.album.current()?.attributes.artwork_url.clone(),
             Stage::Songs => self.focused_song()?.attributes.artwork_url.clone(),
@@ -1206,6 +1439,33 @@ fn field(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
     let mut spans = vec![sp(format!("{:<w$}", label, w = LABEL_WIDTH), FG_DIM)];
     spans.extend(value);
     Line::from(spans)
+}
+
+fn file_lines(slot: &Slot, room: usize) -> Vec<Line<'static>> {
+    let value = room.saturating_sub(LABEL_WIDTH);
+    let meta = &slot.existing;
+    let mut lines = vec![field("name", vec![bold(clip(&slot.name, value), FG)])];
+    let mut add = |label: &str, text: Option<String>| {
+        lines.push(field(
+            label,
+            vec![match text.filter(|t| !t.trim().is_empty()) {
+                Some(t) => sp(clip(&t, value), FG),
+                None => sp("—", FG_FAINT),
+            }],
+        ));
+    };
+    add("title", meta.title.clone());
+    add("artist", meta.artist.clone());
+    add("album", meta.album.clone());
+    add("length", meta.duration_ms.map(|ms| clock(ms as u64)));
+    add(
+        "folder",
+        slot.path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string()),
+    );
+    lines
 }
 
 fn artist_lines(artist: &OmmArtist, room: usize) -> Vec<Line<'static>> {
@@ -1319,49 +1579,57 @@ fn draw_search<T>(
     f: &mut Frame,
     panel: Color,
     area: Rect,
-    title: &str,
+    label: &str,
     pane: &mut Pane<T>,
     row: impl Fn(&T, &str, usize) -> Vec<Span<'static>>,
     field: Color,
 ) {
     fill(f, area, panel);
     let inner = area.inner(Margin::new(2, 1));
-    if inner.height < 5 || inner.width < 10 {
+    if inner.height < 4 || inner.width < 24 {
         return;
     }
 
-    let line = |offset: u16| Rect {
-        y: inner.y + offset,
-        height: 1,
-        ..inner
+    let bar = Rect { height: 1, ..inner };
+    fill(f, bar, field);
+
+    let (status, status_color) = if pane.loading {
+        ("searching…".to_string(), FG_DIM)
+    } else if let Some(error) = pane.error.as_ref() {
+        (clip(error, inner.width as usize / 2), RED)
+    } else if pane.suggested {
+        ("suggested".to_string(), GREEN)
+    } else if pane.changed() {
+        ("…".to_string(), FG_FAINT)
+    } else if pane.results.is_empty() {
+        ("no results".to_string(), ACCENT)
+    } else {
+        (format!("{} results", pane.results.len()), FG_FAINT)
     };
 
-    f.render_widget(Paragraph::new(Line::from(sp(title, FG_FAINT))), line(0));
-
-    let mut prompt = vec![sp("› ", ACCENT)];
-    prompt.extend(input_spans(&pane.input, inner.width as usize - 2));
-    fill(f, line(1), field);
+    let head = format!(" {} ", label);
+    let status_width = status.chars().count() + 1;
+    let input_room = (inner.width as usize)
+        .saturating_sub(head.chars().count() + 2 + status_width)
+        .max(4);
+    let mut prompt = vec![sp(head.clone(), FG_DIM), sp("› ", ACCENT)];
+    let input = input_spans(&pane.input, input_room);
+    let used = head.chars().count()
+        + 2
+        + input
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum::<usize>();
+    prompt.extend(input);
+    let pad = (inner.width as usize).saturating_sub(used + status_width);
+    prompt.push(sp(" ".repeat(pad), FG));
+    prompt.push(sp(status, status_color));
     f.render_widget(
         Paragraph::new(Line::from(prompt)).style(Style::default().bg(field)),
-        line(1),
+        bar,
     );
 
-    let status = if pane.loading {
-        sp("searching…", FG_DIM)
-    } else if let Some(error) = pane.error.as_ref() {
-        sp(clip(error, inner.width as usize), RED)
-    } else if pane.suggested {
-        sp("suggested from your files", GREEN)
-    } else if pane.changed() {
-        sp("searching in a moment…", FG_FAINT)
-    } else if pane.results.is_empty() {
-        sp("no results", ACCENT)
-    } else {
-        sp(format!("{} results", pane.results.len()), FG_FAINT)
-    };
-    f.render_widget(Paragraph::new(Line::from(status)), line(2));
-
-    let rows = (inner.height - 4) as usize;
+    let rows = (inner.height - 2) as usize;
     if pane.selected < pane.offset {
         pane.offset = pane.selected;
     } else if pane.selected >= pane.offset + rows {
@@ -1390,8 +1658,8 @@ fn draw_search<T>(
     f.render_widget(
         Paragraph::new(lines),
         Rect {
-            y: inner.y + 4,
-            height: inner.height - 4,
+            y: inner.y + 2,
+            height: inner.height - 2,
             ..inner
         },
     );
@@ -1472,12 +1740,12 @@ fn draw_summary(f: &mut Frame, app: &App, area: Rect) {
                 ),
                 FG_DIM,
             )),
-            Line::from(sp("enter or ctrl-s writes this folder", FG_DIM)),
+            Line::from(sp("enter or ctrl-s writes these files", FG_DIM)),
             Line::from(sp("page up goes back to review files", FG_FAINT)),
         ]
     } else {
         vec![
-            Line::from(bold("skip this folder", FG)),
+            Line::from(bold("skip these files", FG)),
             Line::from(""),
             Line::from(sp("enter leaves these files untouched", FG_DIM)),
         ]
@@ -1549,7 +1817,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
             let label = if write {
                 format!("write {} files", app.writable())
             } else {
-                "skip this folder".to_string()
+                "skip these files".to_string()
             };
             let color = match (write, app.writable() > 0, selected) {
                 (true, true, _) => GREEN,
@@ -1583,6 +1851,7 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
 
         let mut spans = vec![marker, local, sp(" │ ", FG_FAINT)];
         match (slot.song.as_ref(), slot.state) {
+            _ if slot.skipped => spans.push(sp("skipped", FG_FAINT)),
             (Some(song), _) => {
                 let attrs = &song.attributes;
                 let title = match attrs.track_number {
@@ -1623,6 +1892,98 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+fn draw_files(f: &mut Frame, app: &mut App, area: Rect) {
+    let panel = app.panel();
+    fill(f, area, panel);
+    let inner = area.inner(Margin::new(2, 1));
+    if inner.height < 2 || inner.width < 24 {
+        return;
+    }
+
+    let rows = inner.height as usize;
+    if app.file_cursor < app.file_offset {
+        app.file_offset = app.file_cursor;
+    } else if app.file_cursor >= app.file_offset + rows {
+        app.file_offset = app.file_cursor + 1 - rows;
+    }
+
+    let room = inner.width as usize - 6;
+    let name_width = room * 45 / 100;
+    let meta_width = room - name_width - 1;
+
+    let lines: Vec<Line> = app
+        .pool
+        .iter()
+        .enumerate()
+        .skip(app.file_offset)
+        .take(rows)
+        .map(|(index, slot)| {
+            let selected = index == app.file_cursor;
+            let marker = if selected {
+                bold("▸ ", ACCENT)
+            } else {
+                sp("  ", FG)
+            };
+            let check = if slot.marked {
+                sp("[x] ", GREEN)
+            } else {
+                sp("[ ] ", FG_FAINT)
+            };
+            let name = cell(&slot.name, name_width);
+            let name = if selected {
+                bold(name, FG)
+            } else if slot.marked {
+                sp(name, FG)
+            } else {
+                sp(name, FG_DIM)
+            };
+            let meta = [slot.existing.artist.clone(), slot.existing.title.clone()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" — ");
+            Line::from(vec![
+                marker,
+                check,
+                name,
+                sp(" ", FG),
+                sp(clip(&meta, meta_width), FG_FAINT),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_batch(f: &mut Frame, app: &App, area: Rect) {
+    fill(f, area, app.panel());
+    let inner = area.inner(Margin::new(2, 1));
+    if inner.height < 2 || inner.width < 24 {
+        return;
+    }
+    let room = inner.width as usize - 2;
+    let name_width = room * 45 / 100;
+    let meta_width = room - name_width - 1;
+    let lines: Vec<Line> = app
+        .slots
+        .iter()
+        .take(inner.height as usize)
+        .map(|slot| {
+            let meta = [slot.existing.artist.clone(), slot.existing.title.clone()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" — ");
+            Line::from(vec![
+                sp("  ", FG),
+                sp(cell(&slot.name, name_width), FG),
+                sp(" ", FG),
+                sp(clip(&meta, meta_width), FG_FAINT),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn focused_slot(app: &App) -> Option<&Slot> {
     let index = app.pick.as_ref().map_or(app.cursor, |p| p.slot);
     app.slots.get(index)
@@ -1638,25 +1999,15 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
 
     let room = inner.width as usize;
     let (title, lines) = match app.stage {
+        Stage::Files => (
+            "file",
+            app.pool.get(app.file_cursor).map(|s| file_lines(s, room)),
+        ),
         Stage::Artist => (
             "artist",
             app.artist.current().map(|a| artist_lines(a, room)),
         ),
-        Stage::Album => {
-            let lines = app.album.current().map(|a| {
-                let mut lines = album_lines(a, room);
-                lines.push(Line::from(""));
-                lines.push(Line::from(sp(
-                    format!("your files · {}", app.slots.len()),
-                    FG_FAINT,
-                )));
-                for slot in &app.slots {
-                    lines.push(Line::from(sp(clip(&slot.title, room), FG_DIM)));
-                }
-                lines
-            });
-            ("album", lines)
-        }
+        Stage::Album => ("album", app.album.current().map(|a| album_lines(a, room))),
         Stage::Songs => {
             let local_ms = focused_slot(app).and_then(|s| s.existing.duration_ms);
             let lines = match app.focused_song() {
@@ -1742,7 +2093,7 @@ fn crumbs(app: &App, width: usize) -> Line<'static> {
         spans
     };
 
-    let budget = width.saturating_sub(40) / 2;
+    let budget = width.saturating_sub(60) / 2;
     let artist = app
         .chosen_artist
         .as_ref()
@@ -1759,11 +2110,23 @@ fn crumbs(app: &App, width: usize) -> Line<'static> {
         app.slots.len()
     );
 
-    let mut spans = part(1, Stage::Artist, "artist", artist);
+    let files = if app.stage == Stage::Files {
+        format!(
+            "{}/{} marked",
+            app.pool.iter().filter(|s| s.marked).count(),
+            app.pool.len()
+        )
+    } else {
+        format!("{} files", app.slots.len())
+    };
+
+    let mut spans = part(1, Stage::Files, "files", files);
     spans.push(sp("   ›   ", FG_FAINT));
-    spans.extend(part(2, Stage::Album, "album", album));
+    spans.extend(part(2, Stage::Artist, "artist", artist));
     spans.push(sp("   ›   ", FG_FAINT));
-    spans.extend(part(3, Stage::Songs, "songs", songs));
+    spans.extend(part(3, Stage::Album, "album", album));
+    spans.push(sp("   ›   ", FG_FAINT));
+    spans.extend(part(4, Stage::Songs, "songs", songs));
     Line::from(spans)
 }
 
@@ -1792,44 +2155,145 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         top.push(sp(right, FG_DIM));
     }
 
-    let mut local = vec![sp(clip(&group.rel, room.saturating_sub(10)), FG)];
-    let artist = mode(app.slots.iter().map(|s| s.existing.artist.as_deref()));
-    let album = mode(app.slots.iter().map(|s| s.existing.album.as_deref()));
-    let tags = [artist, album].into_iter().flatten().collect::<Vec<_>>();
-    if !tags.is_empty() {
-        local.push(sp(format!("   tags: {}", tags.join(" — ")), FG_FAINT));
-    }
-
-    f.render_widget(
-        Paragraph::new(vec![Line::from(top), Line::from(local)]),
-        inner,
+    let value = room.saturating_sub(LABEL_WIDTH);
+    let folder = field(
+        "folder",
+        vec![
+            bold(clip(&group.rel, value.saturating_sub(12)), FG),
+            sp(
+                format!("  ·  {} files", app.pool.len() + app.slots.len()),
+                FG_DIM,
+            ),
+        ],
     );
+
+    let tag_slots = if app.slots.is_empty() {
+        &app.pool
+    } else {
+        &app.slots
+    };
+    let artist = mode(tag_slots.iter().map(|s| s.existing.artist.as_deref()));
+    let album = mode(tag_slots.iter().map(|s| s.existing.album.as_deref()));
+    let tags = [artist, album].into_iter().flatten().collect::<Vec<_>>();
+    let tags = if tags.is_empty() {
+        sp("none", FG_FAINT)
+    } else {
+        sp(clip(&tags.join(" — "), value), FG_DIM)
+    };
+    let current_tags = field("tags", vec![tags]);
+
+    let now = match (app.stage, app.pick.as_ref()) {
+        (Stage::Songs, Some(pick)) => {
+            let slot = &app.slots[pick.slot];
+            let mut spans = vec![bold(
+                format!("{}/{}  ", pick.slot + 1, app.slots.len()),
+                ACCENT,
+            )];
+            spans.push(bold(clip(&slot.name, value.saturating_sub(24)), FG));
+            let meta = [
+                slot.existing.title.clone(),
+                slot.existing.artist.clone(),
+                slot.existing.duration_ms.map(|ms| clock(ms as u64)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+            if !meta.is_empty() {
+                spans.push(sp(format!("   {}", clip(&meta, value / 2)), FG_DIM));
+            }
+            let scope = match (
+                pick.scoped,
+                app.chosen_album.as_ref(),
+                app.chosen_artist.as_ref(),
+            ) {
+                (true, Some(album), _) => format!("   in {}", album.attributes.name),
+                (true, None, Some(artist)) => format!("   by {}", artist.attributes.name),
+                _ => "   everywhere".to_string(),
+            };
+            spans.push(sp(clip(&scope, 40), FG_FAINT));
+            field("file", spans)
+        }
+        (Stage::Songs, None) => field("picking", vec![sp("a song for each file", FG)]),
+        (Stage::Files, _) => field(
+            "picking",
+            vec![
+                sp("the files that belong together", FG),
+                sp(
+                    format!(
+                        "   {} of {} marked",
+                        app.pool.iter().filter(|s| s.marked).count(),
+                        app.pool.len()
+                    ),
+                    FG_DIM,
+                ),
+            ],
+        ),
+        (Stage::Artist, _) => field(
+            "picking",
+            vec![
+                sp(format!("one artist for all {} files", app.slots.len()), FG),
+                sp("   ctrl-f if they differ", FG_FAINT),
+            ],
+        ),
+        (Stage::Album, _) => field(
+            "picking",
+            vec![
+                sp(format!("one album for all {} files", app.slots.len()), FG),
+                sp("   ctrl-f if they differ", FG_FAINT),
+            ],
+        ),
+    };
+
+    let lines = vec![
+        Line::from(top),
+        folder,
+        current_tags,
+        now,
+        crumbs(app, room),
+    ];
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let keys: &[(&str, &str)] = match app.stage {
+        Stage::Files => &[
+            ("space", "mark"),
+            ("↑↓", "move"),
+            ("a", "all"),
+            ("n", "none"),
+            ("i", "invert"),
+            ("p", "play in mpv"),
+            ("enter", "tag marked"),
+            ("s", "skip rest of folder"),
+        ],
         Stage::Artist | Stage::Album => &[
             ("type", "search"),
             ("↑↓", "move"),
             ("enter", "choose"),
             ("tab", "next"),
+            ("ctrl-f", "match each file"),
+            ("ctrl-o", "play in mpv"),
             ("shift-tab", "back"),
-            ("ctrl-s", "save folder"),
+            ("ctrl-s", "write files"),
         ],
         Stage::Songs if app.pick.is_some() => &[
             ("type", "search"),
             ("↑↓", "results"),
             ("enter", "use & next file"),
+            ("ctrl-x", "skip file"),
+            ("ctrl-o", "play in mpv"),
             ("pgup/pgdn", "file"),
             ("tab", "widen/narrow"),
             ("shift-tab", "back"),
-            ("ctrl-s", "save folder"),
+            ("ctrl-s", "write files"),
         ],
         Stage::Songs => &[
             ("↑↓", "move"),
+            ("p", "play in mpv"),
             ("enter", "confirm"),
             ("shift-tab", "back"),
-            ("ctrl-s", "save folder"),
+            ("ctrl-s", "write files"),
         ],
     };
 
@@ -1850,94 +2314,77 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 fn ui(f: &mut Frame, app: &mut App) {
     let [content, foot] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(f.area());
-    let [header, _, crumb, _, body] = Layout::vertical([
-        Constraint::Length(4),
-        Constraint::Length(1),
-        Constraint::Length(1),
+    let [header, _, body] = Layout::vertical([
+        Constraint::Length(7),
         Constraint::Length(1),
         Constraint::Min(1),
     ])
     .areas(content.inner(Margin::new(2, 1)));
 
     draw_header(f, app, header);
-    f.render_widget(Paragraph::new(crumbs(app, crumb.width as usize)), crumb);
 
     let panel = app.panel();
-
     let field = app
         .background
         .map_or(Color::Rgb(52, 52, 52), |bg| blend(bg, 14));
 
-    let search_title = |app: &App| {
-        let focus = focused_slot(app).map(|slot| {
-            let length = slot
-                .existing
-                .duration_ms
-                .map(|ms| format!(" · {}", clock(ms as u64)))
-                .unwrap_or_default();
-            format!("{}{}", slot.name, length)
-        });
-        let scope = match (
-            app.pick.as_ref().is_some_and(|p| p.scoped),
-            app.chosen_album.as_ref(),
-            app.chosen_artist.as_ref(),
-        ) {
-            (true, Some(album), _) => format!("in {}", album.attributes.name),
-            (true, None, Some(artist)) => format!("by {}", artist.attributes.name),
-            _ => "everywhere".to_string(),
-        };
-        format!("search for {}  ·  {}", focus.unwrap_or_default(), scope)
+    let [left, right] = Layout::horizontal([Constraint::Percentage(45), Constraint::Min(1)])
+        .spacing(2)
+        .areas(body);
+
+    let split = |area: Rect| -> (Rect, Option<Rect>) {
+        if area.height < 20 {
+            return (area, None);
+        }
+        let [top, bottom] = Layout::vertical([Constraint::Percentage(55), Constraint::Min(1)])
+            .spacing(1)
+            .areas(area);
+        (top, Some(bottom))
     };
 
-    if app.stage == Stage::Songs {
-        if body.height < 18 {
-            draw_table(f, app, body);
-        } else {
-            let [top, bottom] =
-                Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
-                    .spacing(1)
-                    .areas(body);
-            draw_table(f, app, top);
-            if app.pick.is_some() {
-                let title = search_title(app);
-                let [left, right] =
-                    Layout::horizontal([Constraint::Percentage(58), Constraint::Min(1)])
-                        .spacing(2)
-                        .areas(bottom);
-                if let Some(pick) = app.pick.as_mut() {
-                    draw_search(f, panel, left, &title, &mut pick.pane, song_row, field);
-                }
-                draw_detail(f, app, right);
-            } else {
-                draw_summary(f, app, bottom);
-            }
+    match app.stage {
+        Stage::Files => {
+            draw_files(f, app, left);
+            draw_detail(f, app, right);
         }
-    } else {
-        let [left, right] = Layout::horizontal([Constraint::Percentage(58), Constraint::Min(1)])
-            .spacing(2)
-            .areas(body);
-        if app.stage == Stage::Artist {
+        Stage::Artist => {
+            draw_batch(f, app, left);
+            let (search, preview) = split(right);
             draw_search(
                 f,
                 panel,
-                left,
-                "search artist",
+                search,
+                "artist",
                 &mut app.artist,
                 artist_row,
                 field,
             );
-        } else {
-            draw_search(
-                f,
-                panel,
-                left,
-                "search album",
-                &mut app.album,
-                album_row,
-                field,
-            );
+            if let Some(preview) = preview {
+                draw_detail(f, app, preview);
+            }
         }
-        draw_detail(f, app, right);
+        Stage::Album => {
+            draw_batch(f, app, left);
+            let (search, preview) = split(right);
+            draw_search(f, panel, search, "album", &mut app.album, album_row, field);
+            if let Some(preview) = preview {
+                draw_detail(f, app, preview);
+            }
+        }
+        Stage::Songs => {
+            draw_table(f, app, left);
+            if app.pick.is_some() {
+                let (search, preview) = split(right);
+                if let Some(pick) = app.pick.as_mut() {
+                    draw_search(f, panel, search, "song", &mut pick.pane, song_row, field);
+                }
+                if let Some(preview) = preview {
+                    draw_detail(f, app, preview);
+                }
+            } else {
+                draw_summary(f, app, right);
+            }
+        }
     }
     draw_footer(f, app, foot);
 }
@@ -2048,6 +2495,8 @@ mod tests {
             variants: vec![title.to_string()],
             song: None,
             state: MatchState::Done,
+            skipped: false,
+            marked: true,
         }
     }
 
@@ -2055,11 +2504,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let group = Group {
             rel: "Daft Punk/Discovery".to_string(),
-            has_artist: true,
-            has_album: true,
+            artist_dir: "Daft Punk".to_string(),
+            album_dir: "Discovery".to_string(),
             slots: vec![slot("One More Time"), slot("Aerodynamic")],
-            artist_query: "Daft Punk".to_string(),
-            album_query: "Discovery".to_string(),
         };
         let resolver = Arc::new(Resolver::new(reqwest::blocking::Client::new()));
         let mut app = App::new(
@@ -2070,6 +2517,10 @@ mod tests {
             Picker::halfblocks(),
             Some((20, 20, 20)),
         );
+        assert!(app.stage == Stage::Files);
+        render(&mut app, 100, 30);
+        app.on_key(key(KeyCode::Char('a')));
+        app.begin_batch();
         app.artist.apply(Ok(vec![
             artist("Daft Punk"),
             artist("Daft Punk Experience"),
@@ -2222,7 +2673,7 @@ mod tests {
     #[test]
     fn discovery_fills_suggestions_when_tags_are_missing() {
         let (mut app, _rx) = sample_app();
-        app.groups[0].has_artist = false;
+        app.has_artist = false;
         app.artist = Pane::new("Folder Name");
         app.on_resp(Resp::Discovered {
             group_seq: app.group_seq,
@@ -2277,6 +2728,79 @@ mod tests {
         assert!(app.stage == Stage::Songs);
         assert_eq!(app.pick.as_ref().unwrap().pane.query(), "One More Timeqwsx");
         assert_eq!(app.counts.tagged + app.counts.skipped, 0);
+    }
+
+    #[test]
+    fn files_stage_marks_a_subset_and_returns_for_the_rest() {
+        let (tx, _rx) = mpsc::channel();
+        let group = Group {
+            rel: "Mixed".to_string(),
+            artist_dir: String::new(),
+            album_dir: "Mixed".to_string(),
+            slots: vec![slot("A"), slot("B"), slot("C")],
+        };
+        let resolver = Arc::new(Resolver::new(reqwest::blocking::Client::new()));
+        let mut app = App::new(
+            vec![group],
+            tx,
+            resolver,
+            false,
+            Picker::halfblocks(),
+            Some((20, 20, 20)),
+        );
+        assert!(app.stage == Stage::Files);
+        app.on_key(key(KeyCode::Char('n')));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.stage == Stage::Files);
+        app.on_key(key(KeyCode::Char(' ')));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        for (w, h) in [(100, 30), (50, 16)] {
+            render(&mut app, w, h);
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.stage == Stage::Artist);
+        assert_eq!(app.slots.len(), 2);
+        assert_eq!(app.pool.len(), 1);
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(app.stage == Stage::Files);
+        assert_eq!(app.pool.len(), 3);
+        assert!(app.slots.is_empty());
+        app.on_key(key(KeyCode::Char('n')));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(key(KeyCode::Char(' ')));
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Tab));
+        assert!(app.stage == Stage::Songs);
+        app.goto(app.slots.len() + 1);
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.stage == Stage::Files);
+        assert_eq!(app.pool.len(), 2);
+        assert!(app.pool[0].marked && !app.pool[1].marked);
+        render(&mut app, 100, 30);
+    }
+
+    #[test]
+    fn ctrl_x_skips_a_file() {
+        let (mut app, _rx) = sample_app();
+        app.on_key(key(KeyCode::Enter));
+        app.album.apply(Ok(vec![album("Discovery")]));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.stage == Stage::Songs);
+        let writable = app.writable();
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(app.slots[0].skipped);
+        assert_eq!(app.cursor, 1);
+        assert_eq!(app.writable(), writable - 1);
+        let gen_id = app.gen_id;
+        app.on_resp(Resp::Matched {
+            gen_id,
+            slot: 0,
+            result: Ok(Some(Box::new(song("late")))),
+        });
+        assert!(app.slots[0].song.is_none());
+        render(&mut app, 100, 30);
     }
 
     #[test]
