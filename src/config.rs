@@ -58,7 +58,7 @@ impl Default for Formatting {
         let mut replace_chars = HashMap::new();
         replace_chars.insert("/".to_string(), "-".to_string());
         replace_chars.insert(":".to_string(), "-".to_string());
-        replace_chars.insert("?".to_string(), "".to_string());
+        replace_chars.insert("?".to_string(), "？".to_string());
 
         Formatting {
             replace_chars,
