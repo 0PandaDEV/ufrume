@@ -315,22 +315,26 @@ fn omm_ids(candidate: &TagCandidate) -> Vec<(&'static str, String)> {
 }
 
 fn read_omm_song_id(tag: &Tag) -> Option<String> {
+    read_omm_key(tag, SONG_ID_KEY)
+}
+
+fn read_omm_key(tag: &Tag, key: &str) -> Option<String> {
     match tag.tag_type() {
         TagType::Id3v2 => Id3v2Tag::from(tag.clone())
             .into_iter()
             .find_map(|frame| match frame {
-                Frame::UserText(f) if f.description.eq_ignore_ascii_case(SONG_ID_KEY) => {
+                Frame::UserText(f) if f.description.eq_ignore_ascii_case(key) => {
                     Some(f.content.to_string())
                 }
                 _ => None,
             }),
         TagType::VorbisComments => VorbisComments::from(tag.clone())
-            .get(SONG_ID_KEY)
+            .get(key)
             .map(str::to_string),
         TagType::Mp4Ilst => Ilst::from(tag.clone()).into_iter().find_map(|atom| {
             match (atom.ident(), atom.data().next()) {
                 (AtomIdent::Freeform { name, .. }, Some(AtomData::UTF8(v)))
-                    if name.eq_ignore_ascii_case(SONG_ID_KEY) =>
+                    if name.eq_ignore_ascii_case(key) =>
                 {
                     Some(v.clone())
                 }
@@ -339,6 +343,91 @@ fn read_omm_song_id(tag: &Tag) -> Option<String> {
         }),
         _ => None,
     }
+}
+
+pub(crate) fn missing_fields(path: &Path) -> Result<Vec<&'static str>, String> {
+    let tagged_file = lofty::read_from_path(path).map_err(|e| e.to_string())?;
+    let Some(tag) = tagged_file
+        .primary_tag()
+        .or_else(|| tagged_file.first_tag())
+    else {
+        return Ok(vec!["all"]);
+    };
+
+    let blank = |v: Option<std::borrow::Cow<'_, str>>| v.is_none_or(|s| s.trim().is_empty());
+    let item_blank = |key: ItemKey| tag.get_string(key).is_none_or(|s| s.trim().is_empty());
+    let id_blank = |key: &str| read_omm_key(tag, key).is_none_or(|s| s.trim().is_empty());
+
+    let mut missing = Vec::new();
+    if blank(tag.title()) {
+        missing.push("title");
+    }
+    if blank(tag.artist()) {
+        missing.push("artist");
+    }
+    if blank(tag.album()) {
+        missing.push("album");
+    }
+    if item_blank(ItemKey::AlbumArtist) {
+        missing.push("album_artist");
+    }
+    if item_blank(ItemKey::RecordingDate) && item_blank(ItemKey::Year) {
+        missing.push("date");
+    }
+    if tag.track().is_none() {
+        missing.push("track");
+    }
+    if tag.pictures().is_empty() {
+        missing.push("cover");
+    }
+    if id_blank(SONG_ID_KEY) {
+        missing.push("song_id");
+    }
+    if id_blank(ALBUM_ID_KEY) {
+        missing.push("album_id");
+    }
+    if id_blank(ARTIST_ID_KEY) {
+        missing.push("artist_id");
+    }
+    Ok(missing)
+}
+
+pub(crate) fn check_music_files(path: &Path) -> Result<usize, Box<dyn std::error::Error>> {
+    let files = if path.is_file() {
+        if !is_music_file(path) {
+            return Err(format!("not a music file: {}", path.display()).into());
+        }
+        vec![path.to_path_buf()]
+    } else {
+        collect_music_paths(path)
+    };
+
+    let mut results: Vec<(PathBuf, Result<Vec<&'static str>, String>)> = files
+        .into_par_iter()
+        .map(|p| {
+            let r = missing_fields(&p);
+            (p, r)
+        })
+        .collect();
+    results.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let total = results.len();
+    let mut bad = 0;
+    for (p, r) in &results {
+        match r {
+            Ok(m) if m.is_empty() => {}
+            Ok(m) => {
+                bad += 1;
+                println!("{}  [{}]", p.display(), m.join(", "));
+            }
+            Err(e) => {
+                bad += 1;
+                println!("{}  [unreadable: {}]", p.display(), e);
+            }
+        }
+    }
+    eprintln!("{}/{} not fully tagged", bad, total);
+    Ok(bad)
 }
 
 fn save_with_ids(

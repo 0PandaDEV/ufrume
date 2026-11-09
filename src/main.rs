@@ -59,6 +59,10 @@ enum Commands {
         manual: bool,
     },
 
+    Check {
+        path: Option<PathBuf>,
+    },
+
     Update,
 }
 
@@ -223,6 +227,32 @@ fn run_tag(path: Option<PathBuf>, force: bool, plain: bool, manual: bool) {
     }
 }
 
+fn run_check(path: Option<PathBuf>) {
+    let path = match resolve_path(path) {
+        Ok(path) => path,
+        Err(e) => {
+            error!("{}", e);
+            eprintln!("ERROR: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if !path.exists() {
+        eprintln!("ERROR: Path does not exist: {}", path.display());
+        std::process::exit(1);
+    }
+
+    match tag::check_music_files(&path) {
+        Ok(0) => {}
+        Ok(_) => std::process::exit(2),
+        Err(e) => {
+            error!("failed to check files: {}", e);
+            eprintln!("ERROR: Failed to check files: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_update() {
     println!("{} Updating ufrume...", style("[1/1]").bold().dim());
     if let Err(e) = update::run_update() {
@@ -256,6 +286,7 @@ fn main() {
             plain,
             manual,
         } => run_tag(path, force, plain, manual),
+        Commands::Check { path } => run_check(path),
         Commands::Update => run_update(),
     }
 
