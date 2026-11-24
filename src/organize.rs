@@ -57,6 +57,8 @@ pub fn organize_music_files(
         mtime_b.cmp(&mtime_a)
     });
 
+    unify_album_years(&mut sorted_files);
+
     let start_time = Instant::now();
 
     let pb = Arc::new(ProgressBar::new(sorted_files.len() as u64));
@@ -447,6 +449,44 @@ fn move_file(source_path: &Path, target_path: &Path) -> io::Result<()> {
             fs::copy(source_path, target_path)?;
             fs::remove_file(source_path)?;
             Ok(())
+        }
+    }
+}
+
+fn album_key(meta: &AudioMetadata) -> Option<(String, String)> {
+    let album = meta.album.as_ref()?;
+    let artist = meta
+        .album_artist
+        .as_ref()
+        .or(meta.artist.as_ref())
+        .cloned()
+        .unwrap_or_default();
+    Some((artist, album.clone()))
+}
+
+fn unify_album_years(files: &mut [(PathBuf, AudioMetadata)]) {
+    let mut counts: HashMap<(String, String), HashMap<i32, usize>> = HashMap::new();
+    for (_, meta) in files.iter() {
+        if let (Some(key), Some(year)) = (album_key(meta), meta.year) {
+            *counts.entry(key).or_default().entry(year).or_insert(0) += 1;
+        }
+    }
+
+    let chosen: HashMap<(String, String), i32> = counts
+        .into_iter()
+        .filter_map(|(key, years)| {
+            years
+                .into_iter()
+                .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(&a.0)))
+                .map(|(year, _)| (key, year))
+        })
+        .collect();
+
+    for (_, meta) in files.iter_mut() {
+        if let Some(key) = album_key(meta)
+            && let Some(year) = chosen.get(&key)
+        {
+            meta.year = Some(*year);
         }
     }
 }

@@ -795,7 +795,12 @@ impl App {
         }
         self.player = None;
         let spawned = Command::new("mpv")
-            .args(["--force-window=yes", "--really-quiet", "--no-terminal", "--"])
+            .args([
+                "--force-window=yes",
+                "--really-quiet",
+                "--no-terminal",
+                "--",
+            ])
             .arg(&path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2624,11 +2629,11 @@ mod tests {
 
         let (title, variants) = title_variants(None, "03. Daft Punk - Aerodynamic");
         assert_eq!(title, "Daft Punk - Aerodynamic");
-        assert!(variants.contains(&"Aerodynamic".to_string()));
+        assert!(variants.iter().any(|i| i == "Aerodynamic"));
 
         let (title, variants) = title_variants(None, "07 Digital Love");
         assert_eq!(title, "07 Digital Love");
-        assert!(variants.contains(&"Digital Love".to_string()));
+        assert!(variants.iter().any(|i| i == "Digital Love"));
 
         let (title, variants) = title_variants(Some("99 Problems"), "whatever");
         assert_eq!(title, "99 Problems");
