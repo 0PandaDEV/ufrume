@@ -198,6 +198,7 @@ jobs:
   aur-publish:
     name: Publish to AUR
     runs-on: ubuntu-latest
+    container: archlinux:base-devel
     needs: [get-version, release]
     if: needs.get-version.outputs.is_new_release == 'true'
     steps:
@@ -206,7 +207,9 @@ jobs:
 
       - name: Install required packages
         run: |
-          sudo pacman -Sy --noconfirm base-devel
+          pacman -Syu --noconfirm git openssh
+          useradd -m builder
+          git config --global --add safe.directory '*'
 
       - name: Setup SSH for AUR
         run: |
@@ -228,6 +231,7 @@ jobs:
           cd aur-repo
 
           VERSION="${{ needs.get-version.outputs.version }}"
+          VERSION_NUMBER="${VERSION#v}"
 
           sed -i "s/^pkgver=.*/pkgver=$VERSION_NUMBER/" PKGBUILD
 
@@ -241,7 +245,8 @@ jobs:
           sed -i "s|source=(ufrume-[^.]*\.[^.]*\.[^.]*.tar.gz::|source=(ufrume-$VERSION_NUMBER.tar.gz::|" PKGBUILD
           sed -i "s|/archive/v[^.]*\.[^.]*\.[^.]*.tar.gz)|/archive/v$VERSION_NUMBER.tar.gz)|" PKGBUILD
 
-          makepkg --printsrcinfo > .SRCINFO
+          chown -R builder:builder .
+          su builder -c "makepkg --printsrcinfo" > .SRCINFO
 
           echo "=== Updated PKGBUILD ==="
           cat PKGBUILD
@@ -263,7 +268,7 @@ jobs:
 
           git add PKGBUILD .SRCINFO
           git commit -m "Update to version ${{ needs.get-version.outputs.version }}"
-          git push origin master
+          git push origin HEAD
 
   update-homebrew:
     name: Update Homebrew Formula
@@ -350,4 +355,4 @@ jobs:
           
           git add Formula/ufrume.rb
           git commit -m "Update ufrume to ${{ needs.get-version.outputs.version }}"
-          git push origin main
+          git push origin HEAD
